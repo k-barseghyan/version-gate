@@ -1,0 +1,32 @@
+# Core-only configuration example. It contains no backing-store settings.
+# A runnable distribution must provide ControlStore and SnapshotStore beans from
+# separately packaged adapters and add their configuration in its own namespace.
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+version-gate:
+  maximum-lease: ${VERSION_GATE_MAXIMUM_LEASE:PT1H}
+  maximum-component-size: ${VERSION_GATE_MAXIMUM_COMPONENT_SIZE:1GB}
+  maximum-participants-per-resource: ${VERSION_GATE_MAXIMUM_PARTICIPANTS:8}
+  expired-build-sweep-interval: ${VERSION_GATE_SWEEP_INTERVAL:PT30S}
+  participant:
+    connect-timeout: ${VERSION_GATE_PARTICIPANT_CONNECT_TIMEOUT:PT5S}
+    request-timeout: ${VERSION_GATE_PARTICIPANT_REQUEST_TIMEOUT:PT30S}
+    allowed-base-uris: ${VERSION_GATE_PARTICIPANT_ALLOWED_BASE_URIS:}
+    allow-http: ${VERSION_GATE_PARTICIPANT_ALLOW_HTTP:false}
