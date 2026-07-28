@@ -1,7 +1,7 @@
 # Version Gate
 
-Version Gate is the core coordination module for publishing a set of immutable,
-client-produced snapshot components as one visible version.
+Version Gate is a standalone service for publishing a set of immutable,
+client-produced snapshot components as one visible coordinator version.
 
 It solves a narrow problem: readers must not observe a half-refreshed data set
 while producers replace several related payloads. Producers build a candidate
@@ -10,32 +10,22 @@ after it is complete and its active-version pointer is atomically changed.
 
 ## Repository status and scope
 
-This repository deliberately contains:
+This repository is a Maven monorepo containing the stable SPI, framework-free
+core, official adapter modules, executable Spring Boot server, and reusable
+adapter testkit. Adding an official adapter does not add it automatically to
+every distribution; `version-gate-server` declares the selected modules it
+packages.
 
-- the domain model and lifecycle rules;
-- application use cases;
-- the public `ControlStore`, `SnapshotStore`, and participant gateway SPIs;
-- the HTTP API, error, callback-protocol, and OpenAPI contracts; and
-- Spring configuration for composing those pieces.
+The PostgreSQL-control and S3-snapshot modules are explicit placeholders in
+this refactoring change. They establish ownership and dependency boundaries but
+do not yet contain drivers, migrations, SDKs, or production storage beans.
+Consequently, the executable server currently fails fast until exactly one
+`ControlStore` and one `SnapshotStore` implementation are supplied.
 
-It deliberately contains **no production storage implementation**. In
-particular, there is no retained JDBC, database-vendor, object-storage SDK,
-migration, local emulator, container stack, or storage integration-test code.
-The core is not a runnable production service by itself.
-
-A deployable distribution must depend on this core, supply exactly one
-`ControlStore` bean and one `SnapshotStore` bean, and configure the participant
-gateway. Storage adapters should live in independent repositories so their
-drivers, migrations, release cadence, and operational policy do not leak into
-the core.
-
-The anticipated repositories `version-gate-storage-postgres` and
-`version-gate-storage-s3` are names for separately versioned adapter projects,
-not implementations shipped here. PostgreSQL and S3 are non-binding future
-examples; any technology can implement the public SPI if it satisfies the
-semantic contract in [Architecture and consistency](docs/architecture.md).
-An adapter repository depends on a released version of this core for the port
-interfaces and domain value types; the core never depends on an adapter.
+Any future adapter must implement the semantic contract in
+[Architecture and consistency](docs/architecture.md). Infrastructure types
+never cross the SPI, and neither `version-gate-spi` nor `version-gate-core`
+depends on Spring, JDBC, an object-storage SDK, or an adapter.
 
 ## Why immutable versions?
 
@@ -53,8 +43,10 @@ Only step 5 makes the version public. A failed upload, expired lease, process
 restart, or unsuccessful activation leaves the previous version readable.
 
 `beginBuild` is version-oriented concurrency control, not a generic distributed
-lock. Each resource has at most one non-terminal build, and every mutating build
-operation presents the current fencing token.
+lock. Version Gate allocates the next coordinator version and fencing token
+atomically; clients do not choose either value. Failed and abandoned versions
+are never reused, so gaps are valid. Source-system versions belong in separate
+provenance metadata and are not coordinator versions.
 
 ## Snapshot policies
 
@@ -99,31 +91,23 @@ immutable.
 
 ```mermaid
 flowchart LR
-    P[Producers] -->|fenced commands and streams| H[HTTP contract]
-    R[Readers] -->|manifest and component reads| H
-    H --> A[Application use cases]
-    A --> D[Domain lifecycle]
-    A --> C[ControlStore SPI]
-    A --> S[SnapshotStore SPI]
-    C --> CA[External control adapter]
-    S --> SA[External payload adapter]
-    A --> Q[Participant callback gateway]
+    Clients --> Server
+    Server --> Core
+    Core --> SPI
+    SPI --> ControlAdapter
+    SPI --> SnapshotAdapter
 ```
 
-The core has no dependency on a concrete storage driver:
+Module responsibilities and dependency direction:
 
 ```text
-io.github.kbarseghyan.versiongate
-├── api
-├── domain
-├── application
-├── port
-│   ├── ControlStore
-│   ├── SnapshotStore
-│   └── ParticipantGateway
-├── adapter
-│   └── http
-└── configuration
+version-gate/
+├── version-gate-spi                 domain types, stable errors, infrastructure ports
+├── version-gate-core                lifecycle and application use cases
+├── version-gate-control-postgres    official PostgreSQL ControlStore module
+├── version-gate-snapshot-s3         official S3-compatible SnapshotStore module
+├── version-gate-server              HTTP, OpenAPI, callbacks, scheduling, bootstrap
+└── version-gate-testkit             reusable adapter contracts and deterministic stores
 ```
 
 An adapter is not correct merely because it implements the Java methods. It
@@ -142,12 +126,13 @@ must preserve the SPI's transactional and failure semantics:
 See [Architecture and consistency](docs/architecture.md) before implementing or
 selecting an adapter.
 
-## Composing a runnable distribution
+## Server assembly
 
-Spring Boot auto-configuration constructs the use cases, scheduler, HTTP API,
-and participant callback gateway from the public ports; composition does not
-depend on the consuming application's component-scan package. A distribution
-supplies storage beans in its own configuration:
+`version-gate-server` produces an executable Spring Boot JAR and declares the
+selected official adapter modules. Spring Boot auto-configuration constructs
+the use cases, scheduler, HTTP API, and participant callback gateway from the
+public ports. Until the placeholder adapters are implemented, a local
+composition can supply test or experimental storage beans:
 
 ```java
 @Configuration(proxyBeanMethods = false)
@@ -165,11 +150,9 @@ class DistributionStorageConfiguration {
 }
 ```
 
-The distribution should package its own application entry point (or invoke the
-optional core bootstrap with the adapter artifacts on its classpath), and own adapter
-credentials, migrations, health checks, backup, retention, and deployment
-configuration. Starting this repository without those beans is expected to fail
-fast instead of silently using an in-memory or unsafe fallback.
+The selected adapter modules own credentials, migrations, health checks,
+backup, retention, and deployment configuration. Starting without the required
+beans fails fast instead of silently using an in-memory or unsafe fallback.
 
 Core configuration keys are illustrated in
 [config/application-local.example.yml](config/application-local.example.yml).
@@ -190,8 +173,7 @@ When a composed distribution is running, it exposes:
 ## API workflow for a composed distribution
 
 The following `CLIENT_MANAGED` example assumes a correctly composed distribution
-is already listening at `http://localhost:8080`. The core repository does not
-provide the storage adapters needed to start that process.
+is already listening at `http://localhost:8080`.
 
 ```bash
 set -euo pipefail
@@ -213,13 +195,13 @@ BUILD_JSON="$(
     -X POST "$API/resources/$RESOURCE/builds" \
     -H 'Content-Type: application/json' \
     -d '{
-      "targetVersion": 1,
       "owner": "catalog-publisher",
       "leaseSeconds": 300
     }'
 )"
 
 BUILD_ID="$(printf '%s' "$BUILD_JSON" | jq -r .buildId)"
+VERSION="$(printf '%s' "$BUILD_JSON" | jq -r .targetVersion)"
 FENCING_TOKEN="$(printf '%s' "$BUILD_JSON" | jq -r .fencingToken)"
 
 curl --fail-with-body --silent --show-error \
@@ -269,7 +251,7 @@ curl --fail-with-body --silent --show-error \
   "$API/resources/$RESOURCE/versions/active/manifest" | jq .
 
 curl --fail-with-body --silent --show-error \
-  "$API/resources/$RESOURCE/versions/1/components/products"
+  "$API/resources/$RESOURCE/versions/$VERSION/components/products"
 ```
 
 Uploads require `Content-Length`; `curl --data-binary @file` supplies it for a
@@ -354,7 +336,8 @@ documentation must describe any stronger reconciliation it provides.
 V1 intentionally has:
 
 - one candidate build per resource and no multi-resource atomic activation;
-- no concrete production storage adapter in this repository;
+- placeholder PostgreSQL-control and S3-snapshot modules, but no concrete
+  production adapter implementation yet;
 - no snapshot merging, business-schema validation, or restoration;
 - no messaging system, event sourcing, Java client SDK, or generic lock API;
 - no proof that coordinated participants stopped writes;
@@ -366,12 +349,13 @@ V1 intentionally has:
 Requirements are JDK 21 and a POSIX-like shell. The Maven Wrapper pins Maven:
 
 ```bash
-./mvnw verify
+./mvnw clean verify
 ```
 
-Core tests use fakes/mocks at the public ports and require no container runtime.
-Concrete adapter repositories are responsible for their own compatibility,
-concurrency, failure-injection, migration, and integration tests.
+The command verifies every module. `version-gate-testkit` exposes reusable
+`ControlStoreContract` and `SnapshotStoreContract` suites; each concrete
+adapter must also add its own concurrency, failure-injection, migration, and
+provider integration tests.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change expectations.
 

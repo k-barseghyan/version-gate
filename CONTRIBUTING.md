@@ -11,15 +11,15 @@ port signatures, or storage guarantees so the contract can be discussed before
 implementation. Security reports follow [SECURITY.md](SECURITY.md), not the
 public issue tracker.
 
-V1 intentionally excludes concrete production storage adapters, client SDKs,
-messaging systems, cache layers, generic locks, snapshot merging/restoration,
-concurrent candidate versions, and multi-resource or multi-region atomicity.
+The current refactor intentionally leaves the official PostgreSQL-control and
+S3-snapshot modules as placeholders. Client SDKs, messaging systems, cache
+layers, generic locks, snapshot merging/restoration, concurrent candidate
+versions, and multi-resource or multi-region atomicity remain outside V1.
 
-This repository is the core and public SPI. Technology-specific implementations
-belong in separate adapter repositories, such as the anticipated non-binding
-examples `version-gate-storage-postgres` and `version-gate-storage-s3`. Do not
-add a storage driver, provider SDK, migration, emulator, container stack, or
-adapter integration suite to the core.
+Official technology-specific implementations belong in dedicated modules in
+this repository. Drivers, provider SDKs, migrations, emulators, container
+stacks, and adapter integration tests must remain inside their adapter module;
+they must never leak into `version-gate-spi` or `version-gate-core`.
 
 ## Development setup
 
@@ -31,13 +31,25 @@ Requirements:
 Run the complete verification suite:
 
 ```bash
-./mvnw verify
+./mvnw clean verify
 ```
 
-Core tests use fakes or mocks at the public ports and require no database,
-object store, or container runtime.
+Framework-free module tests require no database, object store, or container
+runtime. Concrete adapter integration tests may add scoped infrastructure when
+their implementation is introduced.
 
-## Core change expectations
+## Module boundaries
+
+- `version-gate-spi`: domain types, stable errors, and infrastructure ports;
+  JDK only.
+- `version-gate-core`: lifecycle and application use cases; SPI and JDK only.
+- adapter modules: technology-specific infrastructure.
+- `version-gate-server`: Spring MVC, OpenAPI, callbacks, scheduling, bootstrap,
+  and selected adapter dependencies.
+- `version-gate-testkit`: reusable semantic contracts and deterministic test
+  implementations.
+
+## Change expectations
 
 - Put lifecycle rules in the domain/application boundary, not in controllers.
 - Keep framework, driver, query-language, and provider SDK types out of the
@@ -71,12 +83,12 @@ explain how an adapter can preserve:
 - missing/corrupt/unavailable storage error mapping; and
 - crash recovery, orphan handling, and cleanup safety.
 
-Adapter repositories are responsible for their own driver compatibility,
-migrations, provider limits, concurrency tests, failure injection, and
-integration tests. Core changes should add or update reusable contract tests
-where practical so every adapter can demonstrate equivalent behavior.
+Adapter modules are responsible for their own driver compatibility, migrations,
+provider limits, concurrency tests, failure injection, and integration tests.
+SPI changes should update `version-gate-testkit` so every adapter can
+demonstrate equivalent behavior.
 
-Format and style checks are part of `./mvnw verify`. Keep commits focused and
+Format and style checks are part of `./mvnw clean verify`. Keep commits focused and
 use an imperative summary line. Pull requests should explain the behavior
 change, failure semantics, tests run, and compatibility or operational impact.
 

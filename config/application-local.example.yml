@@ -1,6 +1,6 @@
-# Core-only configuration example. It contains no backing-store settings.
-# A runnable distribution must provide ControlStore and SnapshotStore beans from
-# separately packaged adapters and add their configuration in its own namespace.
+# Server configuration example. Adapter settings belong to their own namespaces.
+# The placeholder adapter modules do not yet provide ControlStore or SnapshotStore
+# beans, so a local composition must supply them explicitly.
 
 spring:
   lifecycle:

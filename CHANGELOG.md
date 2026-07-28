@@ -17,12 +17,18 @@ public version is released.
   idempotency behavior.
 - Bounded participant fan-out, exact callback wire-protocol enforcement, and
   sanitized storage-failure Problem Details with correlation IDs.
+- Reusable `version-gate-testkit` contracts for control and snapshot adapters.
 
 ### Changed
 
-- Corrected the architecture boundary: concrete control and payload storage
-  adapters belong in separately released repositories and are not retained in
-  this core.
+- Refactored the repository into SPI, core, PostgreSQL-control, S3-snapshot,
+  server, and testkit Maven modules.
+- Moved HTTP, OpenAPI, callbacks, scheduling, and Spring Boot bootstrap into the
+  executable `version-gate-server` module.
+- Made `ControlStore.beginBuild` atomically allocate coordinator versions and
+  fencing tokens; clients no longer submit `targetVersion`.
+- Added official PostgreSQL-control and S3-snapshot placeholder modules while
+  keeping concrete adapter implementations outside this refactoring change.
 - Documented adapter requirements for authoritative lease time, atomic
   transitions and activation, publication visibility, immutable byte
   verification, crash safety, and retry semantics.

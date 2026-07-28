@@ -14,39 +14,29 @@ The core safety property is:
 This property applies to the Version Gate metadata pointer. It does not imply
 that independently captured payloads represent one business transaction.
 
-## Core and adapter boundary
+## Module and adapter boundary
 
 ```mermaid
 flowchart LR
-    P[Snapshot producers] -->|fenced HTTP commands<br/>streamed components| H[HTTP contract]
-    R[Snapshot readers] -->|manifest and component reads| H
-    H --> A[Application use cases]
-    A --> D[Domain lifecycle]
-    A --> C[ControlStore SPI]
-    A --> S[SnapshotStore SPI]
-    C --> CA[External control adapter]
-    S --> SA[External payload adapter]
-    A --> Q[Participant callback gateway]
-    Q --> CP[Quiesce participants]
+    Clients --> Server
+    Server --> Core
+    Core --> SPI
+    SPI --> ControlAdapter
+    SPI --> SnapshotAdapter
 ```
 
-This repository contains the domain, application use cases, public ports, and
-HTTP/protocol/configuration contracts. It does not contain a production
-`ControlStore` or `SnapshotStore`.
+The root is a Maven aggregator. `version-gate-spi` owns domain values, stable
+errors, and infrastructure ports without framework dependencies.
+`version-gate-core` owns lifecycle and use cases and depends only on the SPI and
+JDK. Official adapters live beside them as independent modules.
+`version-gate-server` owns HTTP, OpenAPI, callbacks, scheduling, bootstrap, and
+the explicit selection of adapter modules included in its executable JAR.
+`version-gate-testkit` supplies reusable semantic contract tests.
 
-Concrete stores belong in independently released adapter repositories. The
-names `version-gate-storage-postgres` and `version-gate-storage-s3` describe
-anticipated, non-binding future examples; neither implementation is retained in
-this core. Other technologies are equally valid when they satisfy the complete
-contract below.
-
-Each adapter depends on a released core artifact for the public port interfaces
-and domain value types. Dependency direction never points from the core to an
-adapter, and an adapter declares which core/SPI versions it supports.
-
-A runnable distribution depends on the core and selected adapter artifacts and
-provides exactly one Spring bean for each storage port. Missing beans are a
-composition error and should fail startup. The distribution owns driver
+The current PostgreSQL-control and S3-snapshot modules are placeholders: they
+establish the official boundaries but intentionally contain no concrete
+drivers, SDKs, migrations, or storage beans yet. Missing beans remain a
+composition error and fail startup. Future adapter modules own their driver
 configuration, credentials, migrations, health checks, backup, retention, and
 operational documentation.
 
@@ -54,13 +44,24 @@ Framework, driver, query-language, and provider SDK types must not cross the
 ports. An adapter may strengthen durability or observability but must not weaken
 the public semantics.
 
+The architectural rule is:
+
+```text
+SPI defines guarantees
+core defines lifecycle
+adapters implement infrastructure
+server assembles a selected distribution
+testkit proves adapter compatibility
+```
+
 ## Global invariants
 
 The application and adapters jointly preserve:
 
 1. Resource IDs are unique.
 2. A resource has at most one non-terminal build.
-3. A target version is unique within a resource.
+3. Coordinator versions are monotonically allocated by the control store and
+   never reused within a resource.
 4. A component identity is unique within a resource version.
 5. Each resource has at most one active-version pointer.
 6. Every build mutation validates the current fencing token.
@@ -105,7 +106,7 @@ Operation-specific mappings are:
 | Operation | Stable contract errors beyond common validation/storage failures |
 | --- | --- |
 | `registerResource` | Existing ID: `RESOURCE_ALREADY_EXISTS` |
-| `beginBuild` | Unknown resource: `RESOURCE_NOT_FOUND`; live candidate: `BUILD_ALREADY_EXISTS`; reused, non-increasing, or already active target: `VERSION_ALREADY_EXISTS` |
+| `beginBuild` | Unknown resource: `RESOURCE_NOT_FOUND`; live candidate: `BUILD_ALREADY_EXISTS`; allocation failure or incoherent sequence state: `STORAGE_FAILURE` |
 | `renewBuild`, snapshot transitions | Common build/fence/lease errors; wrong source state or policy: `INVALID_BUILD_TRANSITION` |
 | `registerSnapshotComponent` | Wrong identity or non-required component: `VALIDATION_FAILED`; different immutable tuple: `COMPONENT_CONFLICT` |
 | `completeBuild` | Missing required metadata: `INCOMPLETE_SNAPSHOT` |
@@ -122,11 +123,14 @@ Backend unavailability, serialization failure, or incoherent persisted state is
 
 - Mutations for one resource/build must have a well-defined serialization
   point.
-- `beginBuild` atomically verifies resource existence, target-version
-  uniqueness, and absence of another non-terminal build before creating the
-  candidate.
+- `beginBuild` atomically verifies resource existence and absence of another
+  non-terminal build, allocates the next coordinator version and fencing token,
+  and persists the `BUILDING` candidate.
 - Two concurrent begins cannot both succeed. A read-before-write check without
   an atomic constraint, lock, or compare-and-set is insufficient.
+- Coordinator versions are never supplied by clients. They increase
+  monotonically per resource and are not reused after a build fails or is
+  abandoned; gaps are valid.
 - A fencing generation is monotonically increasing for a resource and is never
   reused after ownership changes.
 - The build records the active version observed at begin time as
