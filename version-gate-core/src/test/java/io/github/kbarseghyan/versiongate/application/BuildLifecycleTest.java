@@ -8,6 +8,7 @@ import io.github.kbarseghyan.versiongate.api.ErrorCode;
 import io.github.kbarseghyan.versiongate.api.VersionGateException;
 import io.github.kbarseghyan.versiongate.domain.Build;
 import io.github.kbarseghyan.versiongate.domain.BuildStatus;
+import io.github.kbarseghyan.versiongate.domain.DomainValidation;
 import io.github.kbarseghyan.versiongate.domain.Participant;
 import io.github.kbarseghyan.versiongate.domain.Resource;
 import io.github.kbarseghyan.versiongate.domain.SnapshotPolicy;
