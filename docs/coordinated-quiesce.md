@@ -8,7 +8,8 @@ every participant honoring the protocol.
 This repository defines the protocol and implements its core use cases and HTTP
 callback gateway. Durable build/participant progress and immutable component
 payloads come from the `ControlStore` and `SnapshotStore` supplied by a composed
-distribution. No production storage adapter is included here.
+distribution. The official PostgreSQL-control and S3-snapshot modules are
+placeholders until their concrete implementations are added.
 
 No Java SDK is required. A participant exposes:
 
@@ -59,6 +60,10 @@ All four callbacks receive the same JSON shape. This example represents a
   "leaseExpiresAt": "2030-01-02T03:04:05Z"
 }
 ```
+
+`targetVersion` in this callback is the coordinator version already allocated
+by Version Gate. It is output context for the participant, not a value supplied
+in the public begin-build request.
 
 Each request also carries:
 
@@ -131,7 +136,7 @@ after it enters `QUIESCING`: changing `leaseExpiresAt` would change the callback
 body while reusing the same idempotent action ID.
 
 V1 sends callbacks synchronously and applies the configured timeout to each
-request. The core defaults to at most eight registered participants per
+request. The server defaults to at most eight registered participants per
 resource and always enforces a hard maximum of 32. A distribution should choose
 a smaller configured maximum when necessary so the complete quiesce, capture,
 resume, and failure-cleanup window fits its lease and ingress timeout budgets.
