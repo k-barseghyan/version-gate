@@ -33,12 +33,15 @@ promised before the project establishes a formal security response process.
 
 ## Deployment responsibility
 
-This repository is a coordination core and contains no production storage
-adapter. A runnable distribution selects third-party or separately maintained
-`ControlStore` and `SnapshotStore` implementations. Operators must assess those
-artifacts, their transitive dependencies, migrations, provider permissions, and
-release/support policy independently; inclusion in a distribution does not make
-an adapter part of this repository's security boundary.
+This repository contains one standalone service product. Its Maven modules are
+internal responsibility boundaries, including the official PostgreSQL
+`ControlStore` and S3-compatible `SnapshotStore` modules selected by the
+executable `version-gate-server` distribution. Those official adapter modules
+are currently placeholders, not separately maintained repositories or
+independently published libraries. When implemented, their drivers, SDKs,
+migrations, provider permissions, credentials, and operational behavior are
+part of this repository's security boundary. Operators must also assess any
+replacement adapter that they explicitly compose into their own distribution.
 
 V1 does not provide end-user authentication or TLS termination. Deploy a
 composed distribution behind an authenticated TLS gateway, restrict ingress and

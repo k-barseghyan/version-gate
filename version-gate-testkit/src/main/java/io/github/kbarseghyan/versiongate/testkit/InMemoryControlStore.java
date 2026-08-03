@@ -191,20 +191,21 @@ public final class InMemoryControlStore implements ControlStore {
   public synchronized Build startSnapshotPhase(
       UUID buildId, long fencingToken, BuildStatus targetStatus) {
     Build build = requireBuildAndToken(buildId, fencingToken);
-    Instant now = now();
-    requireValidLease(build, now);
     Resource resource = requireResource(build.resourceId());
     BuildStatus requiredTarget =
         resource.snapshotPolicy() == SnapshotPolicy.CLIENT_MANAGED
             ? BuildStatus.SNAPSHOTTING
             : BuildStatus.QUIESCING;
+    if (targetStatus == requiredTarget
+        && (build.status() == targetStatus
+            || (resource.snapshotPolicy() == SnapshotPolicy.COORDINATED_QUIESCE
+                && build.status() == BuildStatus.SNAPSHOTTING))) {
+      return build;
+    }
+    Instant now = now();
+    requireValidLease(build, now);
     if (targetStatus != requiredTarget) {
       throw invalidTransition(build, "enter " + targetStatus + " for " + resource.snapshotPolicy());
-    }
-    if (build.status() == targetStatus
-        || (resource.snapshotPolicy() == SnapshotPolicy.COORDINATED_QUIESCE
-            && build.status() == BuildStatus.SNAPSHOTTING)) {
-      return build;
     }
     if (build.status() != BuildStatus.BUILDING) {
       throw invalidTransition(build, "start snapshot phase");
@@ -217,14 +218,15 @@ public final class InMemoryControlStore implements ControlStore {
   @Override
   public synchronized Build markSnapshotting(UUID buildId, long fencingToken) {
     Build build = requireBuildAndToken(buildId, fencingToken);
+    Resource resource = requireResource(build.resourceId());
+    if (resource.snapshotPolicy() == SnapshotPolicy.COORDINATED_QUIESCE
+        && build.status() == BuildStatus.SNAPSHOTTING) {
+      return build;
+    }
     Instant now = now();
     requireValidLease(build, now);
-    Resource resource = requireResource(build.resourceId());
     if (resource.snapshotPolicy() != SnapshotPolicy.COORDINATED_QUIESCE) {
       throw invalidTransition(build, "mark a client-managed build as coordinated");
-    }
-    if (build.status() == BuildStatus.SNAPSHOTTING) {
-      return build;
     }
     if (build.status() != BuildStatus.QUIESCING) {
       throw invalidTransition(build, "finish quiescence");
@@ -268,9 +270,7 @@ public final class InMemoryControlStore implements ControlStore {
         new ComponentKey(component.resourceId(), component.version(), component.componentId());
     SnapshotComponent existing = components.get(key);
     if (existing != null) {
-      if (existing.objectKey().equals(component.objectKey())
-          && existing.size() == component.size()
-          && existing.sha256().equals(component.sha256())) {
+      if (existing.hasSameRepresentationIdentity(component)) {
         return existing;
       }
       throw componentConflict(component.componentId());
@@ -362,16 +362,16 @@ public final class InMemoryControlStore implements ControlStore {
     if (build.status() != BuildStatus.READY) {
       throw invalidTransition(build, "activate");
     }
+    ResourceVersion versionKey = new ResourceVersion(build.resourceId(), build.targetVersion());
+    if (!manifests.containsKey(versionKey)) {
+      throw error(
+          ErrorCode.INCOMPLETE_SNAPSHOT, "Build " + build.buildId() + " has no finalized manifest");
+    }
     Resource resource = requireResource(build.resourceId());
     if (!Objects.equals(resource.activeVersion(), build.baseActiveVersion())) {
       throw error(
           ErrorCode.ACTIVATION_CONFLICT,
           "Active version changed while build " + build.buildId() + " was running");
-    }
-    ResourceVersion versionKey = new ResourceVersion(build.resourceId(), build.targetVersion());
-    if (!manifests.containsKey(versionKey)) {
-      throw error(
-          ErrorCode.INCOMPLETE_SNAPSHOT, "Build " + build.buildId() + " has no finalized manifest");
     }
     Resource activatedResource =
         new Resource(
@@ -517,6 +517,37 @@ public final class InMemoryControlStore implements ControlStore {
       currentBuilds.remove(build.resourceId(), buildId);
     }
     return expired.size();
+  }
+
+  /**
+   * Deliberately corrupts activation preconditions for the reusable contract test.
+   *
+   * <p>This package-private test hook is not part of {@link ControlStore}. It preserves the ready
+   * build and fence while removing its manifest and changing the active pointer away from the
+   * build's recorded base, allowing the contract to verify failure precedence.
+   */
+  synchronized void corruptActivationPreconditionsForTest(Build readyBuild) {
+    Build stored = requireBuild(readyBuild.buildId());
+    if (stored.status() != BuildStatus.READY || !stored.equals(readyBuild)) {
+      throw new IllegalArgumentException("readyBuild must be the store's current READY build");
+    }
+    ResourceVersion versionKey = new ResourceVersion(stored.resourceId(), stored.targetVersion());
+    if (manifests.remove(versionKey) == null) {
+      throw new IllegalStateException("readyBuild must have a finalized manifest");
+    }
+    Resource resource = requireResource(stored.resourceId());
+    Long conflictingActiveVersion =
+        stored.baseActiveVersion() == null ? Math.addExact(stored.targetVersion(), 1L) : null;
+    resources.put(
+        resource.resourceId(),
+        new Resource(
+            resource.resourceId(),
+            resource.snapshotPolicy(),
+            resource.requiredComponentIds(),
+            resource.participants(),
+            conflictingActiveVersion,
+            resource.createdAt(),
+            now()));
   }
 
   private Instant now() {

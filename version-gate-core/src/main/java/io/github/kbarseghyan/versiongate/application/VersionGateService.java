@@ -267,6 +267,10 @@ public final class VersionGateService {
       if (command.contentLength() != existing.size()) {
         throw componentConflict(command.componentId());
       }
+      if (!command.contentType().equals(existing.contentType())
+          || !command.contentEncoding().equals(existing.contentEncoding())) {
+        throw componentConflict(command.componentId());
+      }
       SnapshotStore.StoredObject replayed =
           snapshotStore.uploadImmutable(
               new SnapshotStore.Upload(
@@ -799,7 +803,7 @@ public final class VersionGateService {
   private static VersionGateException componentConflict(String componentId) {
     return new VersionGateException(
         ErrorCode.COMPONENT_CONFLICT,
-        "Component " + componentId + " already exists with different content");
+        "Component " + componentId + " already exists with a different immutable representation");
   }
 
   private static void requireStoredObject(

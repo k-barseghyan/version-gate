@@ -25,10 +25,13 @@ flowchart LR
     SPI --> SnapshotAdapter
 ```
 
-The root is a Maven aggregator. `version-gate-spi` owns domain values, stable
-errors, and infrastructure ports without framework dependencies.
+The root is the Maven aggregator for one standalone service product. Its Maven
+modules are internal responsibility and dependency boundaries, not separately
+published Java libraries. The final deployable product is the executable
+`version-gate-server` distribution. `version-gate-spi` owns domain values,
+stable errors, and infrastructure ports without framework dependencies.
 `version-gate-core` owns lifecycle and use cases and depends only on the SPI and
-JDK. Official adapters live beside them as independent modules.
+JDK. Official adapters live beside them as sibling internal modules.
 `version-gate-server` owns HTTP, OpenAPI, callbacks, scheduling, bootstrap, and
 the explicit selection of adapter modules included in its executable JAR.
 `version-gate-testkit` supplies reusable semantic contract tests.
@@ -65,13 +68,16 @@ The application and adapters jointly preserve:
 4. A component identity is unique within a resource version.
 5. Each resource has at most one active-version pointer.
 6. Every build mutation validates the current fencing token.
-7. Lease-sensitive mutations use an adapter-authoritative clock after acquiring
+7. Lease-sensitive mutations use a storage-authoritative clock after acquiring
    the lock or serialization point for the build.
 8. Activation requires `READY`, an unexpired lease, all required components,
    and an unchanged `baseActiveVersion`.
 9. Active manifests and referenced component identities are immutable.
 10. Public version/component lookups reveal a version only after activation.
 11. `FAILED` and `ABANDONED` builds cannot affect the active pointer.
+12. A stored snapshot representation is identified by its object key, exact
+    byte length, full SHA-256, content type, and optional content encoding.
+    Changing any member of that tuple is an immutable-content conflict.
 
 Application-side validation improves error quality but is not the concurrency
 boundary. The adapter is authoritative when requests race.
@@ -90,16 +96,22 @@ precedence under the operation's lock:
 
 1. an unknown build is `BUILD_NOT_FOUND`;
 2. a mismatched fencing token is `STALE_FENCING_TOKEN`;
-3. an exact already-committed idempotent result is returned without mutation;
-4. an expired lease is `LEASE_EXPIRED` for lease-sensitive first attempts;
-5. a disallowed policy or lifecycle state is `INVALID_BUILD_TRANSITION`; and
-6. the operation-specific completeness or compare-and-set check is applied.
+3. an existing immutable component is classified as either an exact replay or
+   `COMPONENT_CONFLICT`;
+4. any other exact already-committed idempotent result is returned without
+   mutation;
+5. an expired lease is `LEASE_EXPIRED` for lease-sensitive first attempts;
+6. a disallowed policy or lifecycle state is `INVALID_BUILD_TRANSITION`; and
+7. the operation-specific completeness or compare-and-set check is applied.
 
-This ordering means an identical component, completion, activation, abort, or
-failure replay remains stable after its original commit, but a wrong fence
-never becomes an idempotent success. A component replay is exact only when its
-object key, byte length, and SHA-256 all match; any different member of that
-tuple is `COMPONENT_CONFLICT`.
+This ordering means an identical component, committed snapshot-phase
+transition, completion, activation, abort, or failure replay remains stable
+after its original commit, but a wrong fence never becomes an idempotent
+success. A component replay is exact only when its object key, byte length,
+SHA-256, content type, and optional content encoding all match; any different
+member of that tuple is `COMPONENT_CONFLICT`. This exact/conflict classification
+precedes lease expiry, phase, and membership checks for an already registered
+component.
 
 Operation-specific mappings are:
 
@@ -139,9 +151,13 @@ Backend unavailability, serialization failure, or incoherent persisted state is
 ### Authoritative time and fencing
 
 The SPI deliberately accepts no caller-supplied timestamp for lease authority.
-An adapter may inject a trusted clock for deterministic adapter tests, but a
-remote caller or independently drifting coordinator JVM never decides the
-validity of a persisted lease.
+A production adapter obtains authoritative time from its storage system; an
+independently drifting coordinator JVM never decides the validity of a
+persisted lease. Reusable contract tests expose authoritative-time advancement
+as an explicit test-fixture capability. An adapter may implement that fixture
+through a deterministic test clock, database test mechanism, or another
+adapter-specific facility without implying that its production implementation
+uses an injected JVM `Clock`.
 
 For every lease-sensitive mutation, the adapter must:
 
@@ -158,11 +174,17 @@ even when an owner name is reused.
 
 - Renewal checks the current fence and permitted state before extending the
   lease.
-- Snapshot-phase transitions reject policy-incompatible or skipped states.
+- Snapshot-phase transitions reject policy-incompatible or skipped states. An
+  exact replay of a committed `startSnapshotPhase` or `markSnapshotting`
+  transition returns that committed result before lease-expiry validation. A
+  first attempt still enforces lease expiry normally, and a wrong fence is
+  never treated as a replay. This ordering permits recovery after an ambiguous
+  response.
 - Component registration atomically checks identity, fence, lease, and build
   state. A retry of an already registered identical component returns the
   stable prior result, including when the build advanced after the original
-  call. Different key, byte length, or SHA-256 for the same identity conflicts.
+  call. Different object key, byte length, SHA-256, content type, or content
+  encoding for the same component identity conflicts.
 - Completion verifies the exact required component set, writes one immutable
   manifest, and moves the build to `READY` in one transaction/atomic operation.
   Replaying a committed completion returns the same manifest.
@@ -171,12 +193,17 @@ even when an owner name is reused.
   a duplicate or reordered request cannot regress either state to quiescing or
   capture progress, even when the callback has a different action ID.
 - Failure, abort, and expiry transitions never move the active pointer.
-- An expiry sweep uses the adapter-authoritative clock and the same locking
-  rules as foreground mutations.
+- One V1 expiry-sweep invocation has a serialized authoritative-time decision
+  point and abandons every build determined to be expired at that point. It
+  uses the storage-authoritative clock and the same locking rules as
+  foreground mutations. A future PostgreSQL adapter may use global
+  serialization for the sweep when necessary to preserve these exact
+  semantics; a best-effort or partial batch is not equivalent.
 
 ### Activation and visibility
 
-Activation is one atomic compare-and-set:
+Activation is one atomic operation whose validation order is part of the
+contract:
 
 1. lock or serialize the resource and candidate;
 2. validate fence, lease, `READY`, and the candidate's immutable manifest;
@@ -184,6 +211,9 @@ Activation is one atomic compare-and-set:
 4. update the active pointer; and
 5. mark the candidate `ACTIVE`.
 
+Manifest completeness and build-state validation occur before the active/base
+pointer comparison. Consequently, an incomplete manifest or invalid build
+state is reported before `ACTIVATION_CONFLICT` when both conditions are true.
 If any check fails, neither the pointer nor candidate visibility changes. A
 replay after a committed activation returns its stable result; a genuine base
 version conflict requires a new build.
@@ -230,12 +260,12 @@ Payload storage is an immutable content plane.
 - The adapter computes SHA-256 over the exact transmitted bytes and records the
   exact byte length.
 - A retry at an existing key succeeds only when the stored key, full byte
-  content, length, and SHA-256 match. Matching provider metadata alone is not
-  proof.
-- Different bytes at an existing immutable key produce
-  `COMPONENT_CONFLICT`, unless authoritative metadata claimed those same bytes
-  and the mismatch therefore proves storage corruption, which is
-  `STORAGE_FAILURE`.
+  content, length, SHA-256, content type, and optional content encoding match.
+  Matching provider metadata alone is not proof of byte equality.
+- Different bytes or different content type/content encoding at an existing
+  immutable key produce `COMPONENT_CONFLICT`, unless authoritative metadata
+  claimed those same bytes and the mismatch therefore proves storage
+  corruption, which is `STORAGE_FAILURE`.
 - An ambiguous write failure is resolved, when possible, by inspecting and
   fully verifying the deterministic key before reporting failure.
 
@@ -244,7 +274,9 @@ Payload storage is an immutable content plane.
 Provider ETags, checksums, headers, or user metadata may assist verification but
 cannot replace the SPI's full key + byte length + SHA-256 guarantee unless the
 provider offers an equivalent authenticated end-to-end guarantee that the
-adapter documents and tests.
+adapter documents and tests. These byte-integrity checks do not replace the
+content-type and content-encoding identity checks required during immutable
+upload and verified open.
 
 - A successful upload is verified against stored bytes before it is returned.
 - `verify(reference)` returns normally only after verifying the referenced key,
@@ -256,19 +288,25 @@ adapter documents and tests.
   close and on every failure path.
 - `open` maps an absent key to `SNAPSHOT_OBJECT_MISSING`. Provider connection,
   timeout, protocol, and integrity failures map to `STORAGE_FAILURE`.
-- `delete` is used only for known-unreferenced payloads. It must not weaken
-  immutable-write behavior or delete data reachable from a published manifest.
+- `delete` is used only for known-unreferenced payloads. V1 production
+  S3-compatible storage requires bucket versioning: deletion fully verifies
+  the exact immutable reference, captures its object version identity, and
+  deletes only that verified version. A missing reference is an idempotent
+  success. Cleanup must not weaken immutable-write behavior, delete a racing
+  replacement version, or delete data reachable from a published manifest.
 
 Empty payloads are valid when allowed by the resource contract. Their length is
-zero and their SHA-256 is the digest of the empty byte sequence. Media type and
-encoding are metadata; adapters do not parse business payloads.
+zero and their SHA-256 is the digest of the empty byte sequence. Content type
+and content encoding are immutable representation identity; adapters preserve
+them but do not parse business payloads.
 
 ## Cross-store publication protocol
 
 There is intentionally no claim of one ACID transaction across the ports:
 
 1. Stream a component to a new immutable payload identity.
-2. Complete the write and verify its key, bytes, length, and SHA-256.
+2. Complete the write and verify its key, bytes, length, SHA-256, content type,
+   and optional content encoding.
 3. Atomically register component metadata, or return the stable identical prior
    result.
 4. Verify every required payload remains resolvable, then atomically finalize
@@ -288,8 +326,8 @@ Only step 5 changes what a public active-version read resolves.
 | Stream/multipart write fails | No component metadata is registered. Incomplete provider state is aborted or becomes safe reconciliation work. |
 | Payload succeeds, metadata commit fails | The immutable payload may be orphaned. It is not manifest-visible and can be removed only after a safe reachability check and grace interval. |
 | Metadata exists, payload is missing or corrupt | Completion and reads fail closed. The active pointer is not silently changed or the bytes silently served. |
-| Duplicate component, identical verified bytes | Return the previously stored component result. |
-| Duplicate component, different bytes | Return a conflict without overwriting payload or metadata. |
+| Duplicate component, identical verified representation | Return the previously stored component result. |
+| Duplicate component, different bytes, content type, or content encoding | Return a conflict without overwriting payload or representation metadata. |
 | Participant cannot quiesce/capture | Fail or abort the attempt, make best-effort cleanup callbacks, and leave the active pointer unchanged. |
 | Activation commit fails or base version changed | Do not change the active pointer or expose the candidate. Distinguish committed replay from genuine CAS conflict. |
 

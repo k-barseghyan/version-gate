@@ -258,6 +258,68 @@ class VersionGateServiceTest {
   }
 
   @Test
+  void priorComponentWithDifferentContentTypeConflictsBeforeSnapshotStorage() {
+    Build build = build(BuildStatus.SNAPSHOTTING);
+    SnapshotComponent prior = component(build, "products", "a".repeat(64));
+    Resource resource = resource(Set.of("products"));
+    when(controlStore.findBuild(build.buildId())).thenReturn(Optional.of(build));
+    when(controlStore.findResource(build.resourceId())).thenReturn(Optional.of(resource));
+    when(controlStore.findSnapshotComponent(build.resourceId(), build.targetVersion(), "products"))
+        .thenReturn(Optional.of(prior));
+
+    VersionGateService.SubmitComponentCommand command =
+        new VersionGateService.SubmitComponentCommand(
+            build.buildId(),
+            build.fencingToken(),
+            "products",
+            new ByteArrayInputStream(new byte[] {1, 2, 3}),
+            3,
+            "application/json",
+            Optional.empty(),
+            Optional.of(prior.sha256()),
+            Optional.empty(),
+            Optional.of(NOW));
+
+    assertThatThrownBy(() -> service.submitSnapshotComponent(command))
+        .isInstanceOfSatisfying(
+            VersionGateException.class,
+            exception -> assertThat(exception.code()).isEqualTo(ErrorCode.COMPONENT_CONFLICT));
+    verifyNoInteractions(snapshotStore);
+    verify(controlStore, never()).registerSnapshotComponent(any(), anyLong(), any());
+  }
+
+  @Test
+  void priorComponentWithDifferentContentEncodingConflictsBeforeSnapshotStorage() {
+    Build build = build(BuildStatus.SNAPSHOTTING);
+    SnapshotComponent prior = component(build, "products", "a".repeat(64));
+    Resource resource = resource(Set.of("products"));
+    when(controlStore.findBuild(build.buildId())).thenReturn(Optional.of(build));
+    when(controlStore.findResource(build.resourceId())).thenReturn(Optional.of(resource));
+    when(controlStore.findSnapshotComponent(build.resourceId(), build.targetVersion(), "products"))
+        .thenReturn(Optional.of(prior));
+
+    VersionGateService.SubmitComponentCommand command =
+        new VersionGateService.SubmitComponentCommand(
+            build.buildId(),
+            build.fencingToken(),
+            "products",
+            new ByteArrayInputStream(new byte[] {1, 2, 3}),
+            3,
+            prior.contentType(),
+            Optional.of("gzip"),
+            Optional.of(prior.sha256()),
+            Optional.empty(),
+            Optional.of(NOW));
+
+    assertThatThrownBy(() -> service.submitSnapshotComponent(command))
+        .isInstanceOfSatisfying(
+            VersionGateException.class,
+            exception -> assertThat(exception.code()).isEqualTo(ErrorCode.COMPONENT_CONFLICT));
+    verifyNoInteractions(snapshotStore);
+    verify(controlStore, never()).registerSnapshotComponent(any(), anyLong(), any());
+  }
+
+  @Test
   void readyCompletionReplayUsesStoredManifestWithoutRecheckingObjects() {
     Build build = build(BuildStatus.READY);
     Resource resource = resource(Set.of("products"));

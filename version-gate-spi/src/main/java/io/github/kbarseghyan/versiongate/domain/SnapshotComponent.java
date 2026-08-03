@@ -73,4 +73,24 @@ public record SnapshotComponent(
                 value, "schemaVersion", DomainValidation.TEXT_MAX_LENGTH));
     Objects.requireNonNull(capturedAt, "capturedAt is required");
   }
+
+  /**
+   * Tests whether another component names the same immutable stored representation.
+   *
+   * <p>Representation identity is deliberately narrower than record equality: the owning build,
+   * resource, version, component ID, schema version, and capture time describe how a representation
+   * is used, but do not change the representation itself. The immutable representation tuple is the
+   * object key, exact byte length, full SHA-256, content type, and optional content encoding.
+   *
+   * @param other component whose stored representation should be compared
+   * @return {@code true} when every immutable representation-identity field matches
+   */
+  public boolean hasSameRepresentationIdentity(SnapshotComponent other) {
+    Objects.requireNonNull(other, "other is required");
+    return objectKey.equals(other.objectKey)
+        && size == other.size
+        && sha256.equals(other.sha256)
+        && contentType.equals(other.contentType)
+        && contentEncoding.equals(other.contentEncoding);
+  }
 }

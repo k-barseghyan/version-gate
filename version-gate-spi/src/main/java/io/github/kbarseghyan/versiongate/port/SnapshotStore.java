@@ -8,10 +8,12 @@ import java.util.Optional;
 /**
  * Storage-neutral contract for immutable snapshot payloads.
  *
- * <p>Implementations live in official or third-party adapter modules. They must stream payloads
- * without materializing the entire content in memory, enforce immutable logical keys, and validate
- * SHA-256 over the exact stored representation (after any content encoding). Backend SDK types,
- * checksums, and exceptions must not cross this boundary.
+ * <p>Implementations are internal adapter boundaries assembled into the executable service
+ * distribution. They must stream payloads without materializing the entire content in memory,
+ * enforce immutable logical keys, and validate SHA-256 over the exact stored representation (after
+ * any content encoding). The immutable representation identity is the logical key, byte length,
+ * SHA-256, content type, and optional content encoding. Backend SDK types, checksums, and
+ * exceptions must not cross this boundary.
  *
  * <p>Expected conflicts are reported through {@code VersionGateException} and its stable error
  * codes. Backend availability or integrity failures use {@code STORAGE_FAILURE}; a missing
@@ -23,12 +25,18 @@ public interface SnapshotStore {
    * Streams and immutably stores an upload.
    *
    * <p>The implementation calculates SHA-256 and checks any expected checksum. A first successful
-   * write returns {@code alreadyExisted=false}. Replaying the same logical key and bytes returns
-   * the original reference with {@code alreadyExisted=true}; different bytes for the key report
-   * {@code COMPONENT_CONFLICT}. A success means the complete payload is durable and its bytes,
-   * length, and checksum have been verified. The adapter must consume exactly {@code
-   * contentLength}; a short or longer body is {@code VALIDATION_FAILED}. The caller retains
-   * ownership of the input stream.
+   * write returns {@code alreadyExisted=false}. Replaying the same logical key, byte length,
+   * SHA-256, content type, and optional content encoding returns the original reference with {@code
+   * alreadyExisted=true}. A difference in any member of that immutable representation identity,
+   * including content type or content encoding when the bytes are identical, reports {@code
+   * COMPONENT_CONFLICT}.
+   *
+   * <p>A success means the complete payload is durable and its bytes, length, checksum, and
+   * representation metadata have been verified. Before resolving an existing key as either a replay
+   * or conflict, the adapter must consume exactly {@code contentLength} and verify the request's
+   * expected SHA-256. A short or longer body is therefore {@code VALIDATION_FAILED}, and a complete
+   * body that differs from its expected digest is {@code CHECKSUM_MISMATCH}, even when the key
+   * already exists. The caller retains ownership of the input stream.
    *
    * @param upload immutable upload request and stream
    * @return authoritative reference and replay indicator
@@ -65,7 +73,10 @@ public interface SnapshotStore {
    * <p>Deletion is idempotent when the payload is already absent. Adapters must never infer
    * reachability themselves; the application invokes this only after durable terminalization. An
    * adapter must not delete a present payload whose length or SHA-256 differs from the supplied
-   * reference.
+   * reference. Deletion must target the exact provider object version that was fully verified, so a
+   * concurrent replacement can never be deleted accidentally. The V1 production S3 adapter must
+   * require bucket versioning and delete the exact verified version by its provider version
+   * identifier; provider identifiers remain private to the adapter.
    *
    * @param objectReference exact logical key, digest, and length eligible for deletion
    */
@@ -127,7 +138,11 @@ public interface SnapshotStore {
   }
 
   /**
-   * Exact identity and integrity metadata for an immutable stored payload.
+   * Exact byte identity and integrity metadata for an immutable stored payload.
+   *
+   * <p>The content type and optional content encoding carried by {@link Upload} and returned by
+   * {@link ObjectContent} complete the immutable representation identity. They are intentionally
+   * not provider-specific object-version identifiers.
    *
    * @param objectKey storage-neutral logical key
    * @param sha256 64-character lowercase digest of the stored bytes
@@ -162,7 +177,7 @@ public interface SnapshotStore {
    * Result of an immutable upload.
    *
    * @param reference authoritative reference for the stored payload
-   * @param alreadyExisted whether an identical immutable object existed before this call
+   * @param alreadyExisted whether an identical immutable representation existed before this call
    */
   record StoredObject(ObjectReference reference, boolean alreadyExisted) {
 
@@ -170,7 +185,7 @@ public interface SnapshotStore {
      * Creates an immutable-upload result.
      *
      * @param reference authoritative reference for the stored payload
-     * @param alreadyExisted whether an identical object existed before the call
+     * @param alreadyExisted whether an identical representation existed before the call
      */
     public StoredObject {
       Objects.requireNonNull(reference, "reference is required");

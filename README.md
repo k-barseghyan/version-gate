@@ -10,11 +10,11 @@ after it is complete and its active-version pointer is atomically changed.
 
 ## Repository status and scope
 
-This repository is a Maven monorepo containing the stable SPI, framework-free
-core, official adapter modules, executable Spring Boot server, and reusable
-adapter testkit. Adding an official adapter does not add it automatically to
-every distribution; `version-gate-server` declares the selected modules it
-packages.
+This repository is a Maven monorepo for one standalone service product. Its
+modules are internal responsibility and dependency boundaries, not
+independently published Java libraries. The deployable product is the
+executable `version-gate-server` distribution, which explicitly selects the
+official adapter modules it packages.
 
 The PostgreSQL-control and S3-snapshot modules are explicit placeholders in
 this refactoring change. They establish ownership and dependency boundaries but
@@ -68,8 +68,9 @@ merge, restore, or business-validate them.
   and current active version.
 - A **build** owns one candidate version, a lease, and a monotonically fenced
   token.
-- A **snapshot component** is an immutable payload plus its key, SHA-256, media
-  type, byte length, capture time, and optional encoding/schema metadata.
+- A **snapshot component** is an immutable representation identified by its
+  key, byte length, SHA-256, content type, and optional content encoding, plus
+  its capture time and optional schema metadata.
 - A **version manifest** describes one complete version and all required
   components.
 
@@ -114,13 +115,13 @@ An adapter is not correct merely because it implements the Java methods. It
 must preserve the SPI's transactional and failure semantics:
 
 - one atomic non-terminal build per resource;
-- an adapter-authoritative lease clock read after the relevant lock;
+- a storage-authoritative lease clock read after the relevant lock;
 - atomic fence, lease, and lifecycle-transition checks;
 - compare-and-set activation against `baseActiveVersion`;
 - no manifest/component visibility through public lookups before activation;
 - immutable, bounded-memory payload writes and reads;
-- full object key, byte-length, and SHA-256 verification rather than trust in
-  provider metadata alone; and
+- full object key, byte-length, SHA-256, content-type, and content-encoding
+  identity checks rather than trust in provider metadata alone; and
 - stable conflict, missing-object, corruption, crash, and retry behavior.
 
 See [Architecture and consistency](docs/architecture.md) before implementing or
@@ -260,9 +261,10 @@ regular file. Supported media types are `application/json`,
 `X-Checksum-SHA256` is optional but recommended. The hash covers the exact
 transmitted bytes, including any content encoding.
 
-Submitting an existing component with the same identity and SHA-256 returns its
-stable prior result. Reusing that identity with different content returns
-`409 Conflict`; bytes and metadata must never be overwritten.
+Submitting an existing component with the same object key, byte length,
+SHA-256, content type, and content encoding returns its stable prior result.
+Changing any member of that immutable representation tuple returns
+`409 Conflict`; bytes and representation metadata must never be overwritten.
 
 Lease renewal uses the same fence:
 
@@ -285,7 +287,9 @@ ownership generation, not an authentication credential.
 
 V1 uses operation-specific idempotency:
 
-- same-content component retries return the prior component;
+- exact-representation component retries return the prior component;
+- a committed snapshot-phase transition retry returns its prior result even if
+  its lease expired after the transition committed;
 - completion and activation retries return their prior successful result; and
 - after an ambiguous `beginBuild` timeout, a client queries the resource's
   current build before deciding whether to begin again.
@@ -331,6 +335,11 @@ V1 has no durable callback or orphan-cleanup reconciliation worker. Recovery
 after an ambiguous crash may require an explicit client/operator retry. Adapter
 documentation must describe any stronger reconciliation it provides.
 
+The V1 production S3-compatible storage profile requires bucket versioning.
+Cleanup first verifies the exact immutable reference and then deletes that
+specific object version, so a racing or replacement version cannot be removed
+by mistake.
+
 ## Operational limitations
 
 V1 intentionally has:
@@ -352,8 +361,10 @@ Requirements are JDK 21 and a POSIX-like shell. The Maven Wrapper pins Maven:
 ./mvnw clean verify
 ```
 
-The command verifies every module. `version-gate-testkit` exposes reusable
-`ControlStoreContract` and `SnapshotStoreContract` suites; each concrete
+The command verifies every internal module. `version-gate-testkit` exposes
+reusable `ControlStoreContract` and `SnapshotStoreContract` suites. Its
+authoritative-time fixture is an explicit test capability rather than an
+assumption that production stores use the coordinator JVM clock. Each concrete
 adapter must also add its own concurrency, failure-injection, migration, and
 provider integration tests.
 

@@ -26,10 +26,10 @@ public final class InMemorySnapshotStore implements SnapshotStore {
     StoredPayload candidate = readUpload(upload);
     StoredPayload existing = payloads.get(upload.objectKey());
     if (existing != null) {
-      if (!Arrays.equals(existing.bytes(), candidate.bytes())) {
+      if (!sameRepresentation(existing, candidate)) {
         throw error(
             ErrorCode.COMPONENT_CONFLICT,
-            "Snapshot object " + upload.objectKey() + " already has different content");
+            "Snapshot object " + upload.objectKey() + " already has a different representation");
       }
       return new StoredObject(existing.reference(), true);
     }
@@ -153,6 +153,14 @@ public final class InMemorySnapshotStore implements SnapshotStore {
           "Snapshot object " + objectReference.objectKey() + " failed integrity verification");
     }
     return payload;
+  }
+
+  private static boolean sameRepresentation(StoredPayload first, StoredPayload second) {
+    return first.reference().size() == second.reference().size()
+        && first.reference().sha256().equals(second.reference().sha256())
+        && first.contentType().equals(second.contentType())
+        && first.contentEncoding().equals(second.contentEncoding())
+        && Arrays.equals(first.bytes(), second.bytes());
   }
 
   private static MessageDigest sha256() {

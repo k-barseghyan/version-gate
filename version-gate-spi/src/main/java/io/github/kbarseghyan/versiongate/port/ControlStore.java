@@ -18,23 +18,27 @@ import java.util.UUID;
 /**
  * Authoritative storage contract for Version Gate control state.
  *
- * <p>Implementations are supplied by official or third-party adapter modules. They must be
- * thread-safe, durable across process restarts, and enforce the documented atomicity rather than
- * relying on application-layer prechecks. In particular, an adapter owns the authoritative clock:
- * it must evaluate lease expiry inside the same critical section as each mutation and only after
- * acquiring any contended lock. Caller or service-process time is never authoritative.
+ * <p>Implementations are internal adapter boundaries assembled into the executable service
+ * distribution. They must be thread-safe, durable across process restarts, and enforce the
+ * documented atomicity rather than relying on application-layer prechecks. In particular, a
+ * production adapter must obtain authoritative time from its storage system after acquiring the
+ * required locks, then evaluate lease expiry inside that same critical section. Caller or
+ * service-process time is never authoritative; deterministic test fixtures do not imply that
+ * production adapters accept an injected JVM clock.
  *
  * <p>Expected conflicts must be reported with the matching {@code ErrorCode} in a {@code
  * VersionGateException}; backend availability or integrity failures use {@code STORAGE_FAILURE}. No
  * framework-, driver-, or vendor-specific type may escape this SPI.
  *
  * <p>Build mutations use one stable precedence under their lock: unknown build ({@code
- * BUILD_NOT_FOUND}), wrong fence ({@code STALE_FENCING_TOKEN}), exact committed replay, expired
- * lease for a lease-sensitive first attempt ({@code LEASE_EXPIRED}), invalid policy/state ({@code
- * INVALID_BUILD_TRANSITION}), then operation-specific completeness or activation-CAS checks. Thus a
- * wrong fence never becomes a replay success, while an exact committed component, completion,
- * activation, abort, or failure replay remains stable after lease expiry. The repository
- * architecture guide defines the complete per-operation mapping.
+ * BUILD_NOT_FOUND}), wrong fence ({@code STALE_FENCING_TOKEN}), classification of an existing
+ * immutable result, expired lease for a lease-sensitive first attempt ({@code LEASE_EXPIRED}),
+ * invalid policy/state ({@code INVALID_BUILD_TRANSITION}), then operation-specific completeness or
+ * activation-CAS checks. Classification returns an exact committed replay and reports {@code
+ * COMPONENT_CONFLICT} for a different representation of an already registered component. Thus a
+ * wrong fence never becomes a replay success, while an exact committed snapshot-phase transition,
+ * component, completion, activation, abort, or failure replay remains stable after lease expiry.
+ * The repository architecture guide defines the complete per-operation mapping.
  */
 public interface ControlStore {
 
@@ -89,7 +93,7 @@ public interface ControlStore {
    *
    * @param buildId build to renew
    * @param fencingToken current positive build token
-   * @param leaseDuration positive duration measured from the adapter's authoritative time
+   * @param leaseDuration positive duration measured from storage-authoritative time
    * @return build with its renewed lease deadline
    */
   Build renewBuild(UUID buildId, long fencingToken, Duration leaseDuration);
@@ -97,8 +101,9 @@ public interface ControlStore {
   /**
    * Atomically enters the requested snapshot phase after validating fence, lease, and lifecycle
    * state. The target must match the resource policy ({@code SNAPSHOTTING} for client-managed,
-   * {@code QUIESCING} for coordinated). Replaying an already successful transition returns the
-   * stable current build.
+   * {@code QUIESCING} for coordinated). After validating build identity and fence, replaying an
+   * already successful transition returns the stable committed result before lease-expiry
+   * validation. A first attempt still requires a live lease.
    *
    * @param buildId build entering its snapshot phase
    * @param fencingToken current positive build token
@@ -108,8 +113,9 @@ public interface ControlStore {
   Build startSnapshotPhase(UUID buildId, long fencingToken, BuildStatus targetStatus);
 
   /**
-   * Atomically advances a coordinated build from {@code QUIESCING} to {@code SNAPSHOTTING}. Replays
-   * after success are idempotent.
+   * Atomically advances a coordinated build from {@code QUIESCING} to {@code SNAPSHOTTING}. After
+   * validating build identity and fence, a replay returns the stable committed result before
+   * lease-expiry validation. A first attempt still requires a live lease.
    *
    * @param buildId coordinated build that completed quiescence
    * @param fencingToken current positive build token
@@ -139,9 +145,10 @@ public interface ControlStore {
    * Atomically registers immutable component metadata for a snapshotting build.
    *
    * <p>For a new component, the adapter validates build identity, fence, live lease, phase, and
-   * required-component membership. An exact replay must match the original object key, size, and
-   * SHA-256 and returns the original component even after completion; a replay with a different
-   * object key, size, or SHA-256 reports {@code COMPONENT_CONFLICT}.
+   * required-component membership. An exact replay must match the original object key, size,
+   * SHA-256, content type, and optional content encoding and returns the original component even
+   * after completion and lease expiry; a replay with a different member of that immutable
+   * representation tuple reports {@code COMPONENT_CONFLICT} before lease validation.
    *
    * @param buildId build that owns the component
    * @param fencingToken current positive build token
@@ -187,9 +194,11 @@ public interface ControlStore {
    * Atomically compare-and-sets the active-version pointer and marks a {@code READY} build {@code
    * ACTIVE}.
    *
-   * <p>The adapter must validate fence, lease, finalized manifest, and that the current active
-   * version still equals the build's recorded base version. The pointer change and build status
-   * change are one atomic operation. A replay after success returns the same build.
+   * <p>The adapter must validate fence, lease, {@code READY} state, and finalized manifest before
+   * checking that the current active version still equals the build's recorded base version.
+   * Consequently, invalid state or a missing manifest takes precedence over {@code
+   * ACTIVATION_CONFLICT}. The pointer change and build status change are one atomic operation. A
+   * replay after success returns the same build.
    *
    * @param buildId ready build to activate
    * @param fencingToken current positive build token
@@ -266,6 +275,10 @@ public interface ControlStore {
   /**
    * Atomically marks every expired non-terminal build {@code ABANDONED} using the adapter's
    * authoritative clock and returns the number changed.
+   *
+   * <p>One V1 invocation has a serialized authoritative-time decision point and abandons every
+   * build determined to be expired at that point. Implementations may use global serialization when
+   * necessary; a partial or best-effort batch does not satisfy this contract.
    *
    * @return number of builds changed by this invocation
    */
