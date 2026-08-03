@@ -1,12 +1,15 @@
 # Version Gate
 
-Version Gate is a standalone service for publishing a set of immutable,
-client-produced snapshot components as one visible coordinator version.
+Version Gate is a standalone service for coordinating coherent writes and
+reads across distributed data. It assigns ordered coordinator versions,
+prevents incompatible live operations from overlapping, and can also maintain
+immutable snapshots as an optional secondary capability.
 
-It solves a narrow problem: readers must not observe a half-refreshed data set
-while producers replace several related payloads. Producers build a candidate
-version behind a fenced lease; the candidate becomes publicly readable only
-after it is complete and its active-version pointer is atomically changed.
+Clients can obtain a coherent view in two ways: register a live read that
+temporarily blocks writers, or retrieve an already stored immutable snapshot.
+Snapshot providers register their generation window so Version Gate can bind
+the result to the correct version and prevent an incoherent snapshot from being
+stored.
 
 ## Repository status and scope
 
@@ -22,71 +25,54 @@ do not yet contain drivers, migrations, SDKs, or production storage beans.
 Consequently, the executable server currently fails fast until exactly one
 `ControlStore` and one `SnapshotStore` implementation are supplied.
 
+The current code is a snapshot-first prototype and does not yet implement the
+accepted four-flow model or its configurable business policies. The target
+client behavior is recorded in
+[Business rules and policy model](docs/business-rules.md). That document is
+informative until the SPI, HTTP API, configuration, and tests are revised in a
+later phase.
+
 Any future adapter must implement the semantic contract in
 [Architecture and consistency](docs/architecture.md). Infrastructure types
 never cross the SPI, and neither `version-gate-spi` nor `version-gate-core`
 depends on Spring, JDBC, an object-storage SDK, or an adapter.
 
-## Why immutable versions?
+## Business model
 
-Updating a cache or materialized data set in place creates an interval in which
-readers can observe a mixture of old and new values. Version Gate instead gives
-every refresh a distinct version:
+Version Gate distinguishes four flows:
 
-1. create a `BUILDING` candidate and fenced lease;
-2. capture and upload immutable components;
-3. verify that the required version is complete;
-4. finalize its immutable manifest as `READY`; and
-5. compare-and-set the resource's active pointer and mark the build `ACTIVE`.
-
-Only step 5 makes the version public. A failed upload, expired lease, process
-restart, or unsuccessful activation leaves the previous version readable.
-
-`beginBuild` is version-oriented concurrency control, not a generic distributed
-lock. Version Gate allocates the next coordinator version and fencing token
-atomically; clients do not choose either value. Failed and abandoned versions
-are never reused, so gaps are valid. Source-system versions belong in separate
-provenance metadata and are not coordinator versions.
-
-## Snapshot policies
-
-| Policy | Consistency responsibility |
+| Flow | Purpose |
 | --- | --- |
-| `CLIENT_MANAGED` | The client decides when and how to capture an acceptable state. Version Gate validates ownership, immutability, and completeness before activation. |
-| `COORDINATED_QUIESCE` | Version Gate asks registered participants to quiesce, capture, and resume through HTTP callbacks. Participants still perform write protection and snapshot production. |
+| Coordinated write | Allocates the next version and prevents incompatible live operations from overlapping the write. |
+| Coordinated live read | Blocks writers while a client reads live distributed data. |
+| Snapshot generation | Binds an external aggregation session to the active version; policy chooses whether an arriving writer waits or invalidates it. |
+| Stored snapshot retrieval | Reads immutable data without acquiring a live-data lock. |
 
-`COORDINATED_QUIESCE` is cooperative. Version Gate cannot stop writes in a
-participant's database or prove that a participant obeyed the request. See
-[the coordinated-quiesce protocol](docs/coordinated-quiesce.md).
+Snapshots are optional. A resource can use only write/live-read coordination,
+require a current snapshot before admitting another writer, or allow snapshot
+gaps. Stored snapshot readers can request an explicit version, the current
+version, or the latest available snapshot, and can independently reject reads
+while a write is in progress.
 
-Component bodies are opaque streams. Version Gate does not interpret, join,
-merge, restore, or business-validate them.
+The complete compatibility matrix, policy combinations, lifecycle rules, and
+conceptual rejection outcomes are maintained in
+[Business rules and policy model](docs/business-rules.md). Future configuration
+documentation will be derived from that contract.
 
-## Model and lifecycle
+## Fixed safety rules
 
-- A **resource** names a logical data set, its policy, required component IDs,
-  and current active version.
-- A **build** owns one candidate version, a lease, and a monotonically fenced
-  token.
-- A **snapshot component** is an immutable representation identified by its
-  key, byte length, SHA-256, content type, and optional content encoding, plus
-  its capture time and optional schema metadata.
-- A **version manifest** describes one complete version and all required
-  components.
+- Writes never overlap other writes or coordinated live reads.
+- Policy may allow a writer to invalidate snapshot generation, but the
+  invalidated snapshot is never stored.
+- Successful write completion immediately activates its version; the target
+  model has no `READY` business state.
+- Stored snapshots are immutable and explicit by version.
+- Stored snapshot retrieval blocks no live operation.
+- All coordination depends on client participation and durable leases/fencing.
 
-```text
-CLIENT_MANAGED:
-  BUILDING -> SNAPSHOTTING -> READY -> ACTIVE
-
-COORDINATED_QUIESCE:
-  BUILDING -> QUIESCING -> SNAPSHOTTING -> READY -> ACTIVE
-
-Any non-terminal state -> FAILED or ABANDONED
-```
-
-`QUIESCING` is valid only for `COORDINATED_QUIESCE`. `FAILED`, `ABANDONED`, and
-`ACTIVE` are terminal. Active manifests and their component identities are
-immutable.
+Snapshot bodies remain opaque. Version Gate verifies representation identity
+and completeness but does not interpret, join, restore, or business-validate
+client data.
 
 ## Architecture
 
@@ -171,10 +157,12 @@ When a composed distribution is running, it exposes:
 - OpenAPI JSON at `/v3/api-docs`; and
 - Swagger UI at `/swagger-ui.html`.
 
-## API workflow for a composed distribution
+## Current prototype API workflow
 
 The following `CLIENT_MANAGED` example assumes a correctly composed distribution
-is already listening at `http://localhost:8080`.
+is already listening at `http://localhost:8080`. It documents the API currently
+implemented on `main`; it is not the endpoint or configuration contract for the
+accepted four-flow target model.
 
 ```bash
 set -euo pipefail

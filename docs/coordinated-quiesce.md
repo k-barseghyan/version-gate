@@ -1,5 +1,13 @@
 # Coordinated quiescence protocol
 
+> **Prototype status:** This document describes the callback-driven protocol
+> implemented by the current snapshot-first prototype. It is not part of the
+> accepted target business model. In that model, an external snapshot provider
+> registers a snapshot-generation session, reads the distributed data itself,
+> and submits the result; Version Gate does not trigger generation through
+> participant callbacks. See
+> [Business rules and policy model](business-rules.md).
+
 `COORDINATED_QUIESCE` coordinates a protected capture window across registered
 HTTP participants. It is deliberately cooperative: Version Gate cannot suspend
 writes in another service or database. The consistency of the result depends on

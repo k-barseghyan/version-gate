@@ -21,6 +21,9 @@ public version is released.
 
 ### Changed
 
+- Documented the accepted four-flow target model, fixed coordination rules,
+  client-selectable snapshot policies, and fail-fast snapshot retrieval
+  semantics separately from the current snapshot-first prototype.
 - Refactored the repository into SPI, core, PostgreSQL-control, S3-snapshot,
   server, and testkit Maven modules.
 - Moved HTTP, OpenAPI, callbacks, scheduling, and Spring Boot bootstrap into the

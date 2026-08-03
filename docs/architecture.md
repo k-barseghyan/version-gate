@@ -1,10 +1,21 @@
 # Architecture and consistency
 
+> **Design status:** The current architecture and SPI below implement the
+> snapshot-first prototype. The accepted target product behavior now separates
+> coordinated writes, coordinated live reads, snapshot generation, and stored
+> snapshot retrieval. Its compatibility rules and configurable policies are
+> recorded in [Business rules and policy model](business-rules.md). That model
+> is informative until it is implemented; where this document describes
+> mandatory snapshots, `READY`, build-coupled snapshot phases, or coordinated
+> callbacks, it describes current code rather than the target client contract.
+
 ## Scope
 
-Version Gate publishes a set of immutable, client-produced snapshot components
-as one resource version. It coordinates publication; it does not understand the
-payloads or provide a distributed transaction across their producers.
+The current prototype publishes a set of immutable, client-produced snapshot
+components as one resource version. The target service has a broader primary
+role: it coordinates writes and coherent live reads, while immutable snapshots
+remain an optional secondary capability. It does not understand payloads or
+provide a distributed transaction across their producers.
 
 The core safety property is:
 
