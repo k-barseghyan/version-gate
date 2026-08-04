@@ -14,14 +14,17 @@ import static org.mockito.Mockito.when;
 import io.github.kbarseghyan.versiongate.api.ErrorCode;
 import io.github.kbarseghyan.versiongate.api.VersionGateException;
 import io.github.kbarseghyan.versiongate.domain.LiveReadSession;
+import io.github.kbarseghyan.versiongate.domain.LiveReadStatus;
 import io.github.kbarseghyan.versiongate.domain.MissingCurrentSnapshotPolicy;
 import io.github.kbarseghyan.versiongate.domain.Resource;
 import io.github.kbarseghyan.versiongate.domain.ResourcePolicies;
 import io.github.kbarseghyan.versiongate.domain.RetrievalDuringWritePolicy;
 import io.github.kbarseghyan.versiongate.domain.SnapshotGenerationSession;
+import io.github.kbarseghyan.versiongate.domain.SnapshotGenerationStatus;
 import io.github.kbarseghyan.versiongate.domain.SnapshotSelector;
 import io.github.kbarseghyan.versiongate.domain.SnapshotSupport;
 import io.github.kbarseghyan.versiongate.domain.WriteSession;
+import io.github.kbarseghyan.versiongate.domain.WriteStatus;
 import io.github.kbarseghyan.versiongate.domain.WriterDuringSnapshotPolicy;
 import io.github.kbarseghyan.versiongate.port.VersionGateStore;
 import java.io.ByteArrayInputStream;
@@ -102,13 +105,46 @@ class VersionGateServiceTest {
 
   @Test
   void sessionLookupsReturnCurrentStateAndMapMissingSessions() {
-    WriteSession write = mock(WriteSession.class);
-    LiveReadSession read = mock(LiveReadSession.class);
-    SnapshotGenerationSession snapshot = mock(SnapshotGenerationSession.class);
     UUID writeId = UUID.fromString("00000000-0000-0000-0000-000000000001");
     UUID readId = UUID.fromString("00000000-0000-0000-0000-000000000002");
     UUID snapshotId = UUID.fromString("00000000-0000-0000-0000-000000000003");
     UUID missingId = UUID.fromString("00000000-0000-0000-0000-000000000004");
+    Instant leaseExpiresAt = NOW.plus(Duration.ofMinutes(5));
+    WriteSession write =
+        new WriteSession(
+            writeId,
+            "catalog",
+            1,
+            null,
+            WriteStatus.WRITING,
+            "writer",
+            1,
+            leaseExpiresAt,
+            Optional.empty(),
+            NOW,
+            NOW);
+    LiveReadSession read =
+        new LiveReadSession(
+            readId,
+            "catalog",
+            1,
+            LiveReadStatus.READING,
+            "reader",
+            2,
+            leaseExpiresAt,
+            NOW,
+            NOW);
+    SnapshotGenerationSession snapshot =
+        new SnapshotGenerationSession(
+            snapshotId,
+            "catalog",
+            1,
+            SnapshotGenerationStatus.GENERATING,
+            "snapshotter",
+            3,
+            leaseExpiresAt,
+            NOW,
+            NOW);
     when(store.findWriteSession(writeId)).thenReturn(Optional.of(write));
     when(store.findLiveReadSession(readId)).thenReturn(Optional.of(read));
     when(store.findSnapshotSession(snapshotId)).thenReturn(Optional.of(snapshot));

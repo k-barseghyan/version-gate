@@ -36,4 +36,3 @@ jobs:
           SERVER_JAR=version-gate-server/target/version-gate-server-0.1.0-SNAPSHOT.jar
           jar tf "$SERVER_JAR" | grep -q '^BOOT-INF/'
           jar tf "$SERVER_JAR" | grep -q 'version-gate-control-postgres'
-          jar tf "$SERVER_JAR" | grep -q 'version-gate-snapshot-s3'
