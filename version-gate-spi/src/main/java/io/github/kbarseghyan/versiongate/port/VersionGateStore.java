@@ -57,9 +57,11 @@ public interface VersionGateStore {
    *
    * <p>Expired claims are classified using storage-authoritative time. A live reader rejects the
    * writer before an active snapshot session can be invalidated. With {@code INVALIDATE_SNAPSHOT},
-   * invalidation and successful write admission are one commit.
+   * invalidation and successful write admission are one commit. The idempotency key is scoped to
+   * this resource and operation and is committed atomically with successful admission.
    */
-  WriteSession beginWrite(String resourceId, String owner, Duration leaseDuration);
+  SessionAdmission<WriteSession> beginWrite(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey);
 
   /** Returns a write session, including terminal history, or empty when unknown. */
   Optional<WriteSession> findWriteSession(UUID sessionId);
@@ -83,9 +85,11 @@ public interface VersionGateStore {
    * Begins a leased, fenced live read bound by the store to the active version.
    *
    * <p>Several readers may coexist. An active write rejects admission; snapshot generation does
-   * not.
+   * not. The idempotency key is scoped to this resource and operation and is committed atomically
+   * with successful admission.
    */
-  LiveReadSession beginLiveRead(String resourceId, String owner, Duration leaseDuration);
+  SessionAdmission<LiveReadSession> beginLiveRead(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey);
 
   /** Returns a live-read session, including terminal history, or empty when unknown. */
   Optional<LiveReadSession> findLiveReadSession(UUID sessionId);
@@ -102,10 +106,15 @@ public interface VersionGateStore {
   /**
    * Begins external snapshot generation bound by the store to the active version.
    *
-   * <p>Snapshot support must be enabled, no write may be active, and no earlier generation session
-   * may exist for the bound resource version. Live reads may coexist with generation.
+   * <p>Snapshot support must be enabled, no write may be active, no snapshot may already exist for
+   * the bound resource version, and no generation session may currently be active. An aborted,
+   * expired, or invalidated terminal attempt remains in history but does not prevent another
+   * attempt while the same version remains active. Live reads may coexist with generation. The
+   * idempotency key is scoped to this resource and operation and is committed atomically with
+   * successful admission.
    */
-  SnapshotGenerationSession beginSnapshot(String resourceId, String owner, Duration leaseDuration);
+  SessionAdmission<SnapshotGenerationSession> beginSnapshot(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey);
 
   /** Returns a snapshot-generation session, including terminal history, or empty when unknown. */
   Optional<SnapshotGenerationSession> findSnapshotSession(UUID sessionId);
@@ -139,6 +148,27 @@ public interface VersionGateStore {
    */
   SnapshotContent getSnapshot(
       String resourceId, SnapshotSelector selector, OptionalLong requestedVersion);
+
+  /**
+   * Result of an idempotent session-admission request.
+   *
+   * <p>Every begin operation scopes its client-supplied idempotency key by resource and operation.
+   * The first successful admission atomically persists the request fingerprint and session. An
+   * exact retry returns the same session identity in its current durable state without extending
+   * the lease or re-evaluating admission policies. Reusing the key with a different owner or lease
+   * duration reports {@code IDEMPOTENCY_KEY_CONFLICT}. Failed admissions do not reserve a key. V1
+   * retains successful admission records with session history and never reuses their keys.
+   *
+   * @param session admitted session in its current durable state
+   * @param replayed whether a prior successful admission used the same scoped key and fingerprint
+   */
+  record SessionAdmission<T>(T session, boolean replayed) {
+
+    /** Creates a validated admission result. */
+    public SessionAdmission {
+      Objects.requireNonNull(session, "session is required");
+    }
+  }
 
   /**
    * Streaming request for one complete immutable snapshot representation.

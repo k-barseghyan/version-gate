@@ -2,6 +2,7 @@ package io.github.kbarseghyan.versiongate.testkit;
 
 import io.github.kbarseghyan.versiongate.api.ErrorCode;
 import io.github.kbarseghyan.versiongate.api.VersionGateException;
+import io.github.kbarseghyan.versiongate.domain.DomainValidation;
 import io.github.kbarseghyan.versiongate.domain.LiveReadSession;
 import io.github.kbarseghyan.versiongate.domain.LiveReadStatus;
 import io.github.kbarseghyan.versiongate.domain.MissingCurrentSnapshotPolicy;
@@ -46,16 +47,17 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
 
   private static final int COPY_BUFFER_SIZE = 8192;
 
-  private final Object monitor = new Object();
   private final Clock authoritativeClock;
-  private final Map<String, ResourceState> resources = new HashMap<>();
-  private final Map<UUID, WriteSession> writeSessions = new HashMap<>();
-  private final Map<UUID, String> writeResources = new HashMap<>();
-  private final Map<UUID, LiveReadSession> liveReadSessions = new HashMap<>();
-  private final Map<UUID, String> liveReadResources = new HashMap<>();
-  private final Map<UUID, SnapshotGenerationSession> snapshotSessions = new HashMap<>();
-  private final Map<UUID, String> snapshotResources = new HashMap<>();
-  private long nextSessionSequence = 1;
+  private final BackingState backingState;
+  private final Object monitor;
+  private final Map<String, ResourceState> resources;
+  private final Map<UUID, WriteSession> writeSessions;
+  private final Map<UUID, String> writeResources;
+  private final Map<UUID, LiveReadSession> liveReadSessions;
+  private final Map<UUID, String> liveReadResources;
+  private final Map<UUID, SnapshotGenerationSession> snapshotSessions;
+  private final Map<UUID, String> snapshotResources;
+  private final Map<AdmissionKey, AdmissionRecord> admissions;
 
   /**
    * Creates a deterministic store.
@@ -63,8 +65,29 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
    * @param authoritativeClock clock representing storage-authoritative time
    */
   public InMemoryVersionGateStore(Clock authoritativeClock) {
-    this.authoritativeClock =
-        Objects.requireNonNull(authoritativeClock, "authoritativeClock is required");
+    this(new BackingState(authoritativeClock));
+  }
+
+  /**
+   * Reconstructs a deterministic store around existing backing state.
+   *
+   * <p>This constructor is a test capability for proving that authoritative state belongs to the
+   * store boundary rather than one application or adapter object.
+   *
+   * @param backingState state retained across reconstructed in-memory store instances
+   */
+  public InMemoryVersionGateStore(BackingState backingState) {
+    this.backingState = Objects.requireNonNull(backingState, "backingState is required");
+    authoritativeClock = backingState.authoritativeClock;
+    monitor = backingState.monitor;
+    resources = backingState.resources;
+    writeSessions = backingState.writeSessions;
+    writeResources = backingState.writeResources;
+    liveReadSessions = backingState.liveReadSessions;
+    liveReadResources = backingState.liveReadResources;
+    snapshotSessions = backingState.snapshotSessions;
+    snapshotResources = backingState.snapshotResources;
+    admissions = backingState.admissions;
   }
 
   @Override
@@ -91,12 +114,25 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
   }
 
   @Override
-  public WriteSession beginWrite(String resourceId, String owner, Duration leaseDuration) {
-    requirePositiveDuration(leaseDuration);
+  public SessionAdmission<WriteSession> beginWrite(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey) {
+    requireBeginInputs(owner, leaseDuration, idempotencyKey);
     synchronized (monitor) {
       ResourceState state = requireResource(resourceId);
       Instant now = authoritativeClock.instant();
       expireSessions(state, now);
+      AdmissionKey admissionKey =
+          new AdmissionKey(resourceId, BeginOperation.WRITE, idempotencyKey);
+      AdmissionFingerprint fingerprint = new AdmissionFingerprint(owner, leaseDuration);
+      AdmissionRecord priorAdmission = admissions.get(admissionKey);
+      if (priorAdmission != null) {
+        requireSameFingerprint(priorAdmission, fingerprint);
+        WriteSession priorSession = writeSessions.get(priorAdmission.sessionId());
+        if (priorSession == null) {
+          throw failure(ErrorCode.STORAGE_FAILURE, "Write admission history is inconsistent");
+        }
+        return new SessionAdmission<>(priorSession, true);
+      }
       if (state.activeWriteSessionId != null) {
         throw failure(
             ErrorCode.WRITE_ALREADY_ACTIVE, "A write is already active for " + resourceId);
@@ -124,10 +160,11 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
 
       long allocatedVersion = state.nextVersion;
       long fencingToken = state.nextFencingToken;
-      UUID sessionId = new UUID(0L, nextSessionSequence);
+      UUID sessionId = new UUID(0L, backingState.nextSessionSequence);
       long followingVersion = incrementSequence(allocatedVersion, "coordinator version");
       long followingFencingToken = incrementSequence(fencingToken, "fencing token");
-      long followingSessionSequence = incrementSequence(nextSessionSequence, "session identifier");
+      long followingSessionSequence =
+          incrementSequence(backingState.nextSessionSequence, "session identifier");
       Instant leaseExpiresAt = now.plus(leaseDuration);
       WriteSession session =
           new WriteSession(
@@ -152,11 +189,12 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
       }
       state.nextVersion = followingVersion;
       state.nextFencingToken = followingFencingToken;
-      nextSessionSequence = followingSessionSequence;
+      backingState.nextSessionSequence = followingSessionSequence;
       writeSessions.put(sessionId, session);
       writeResources.put(sessionId, resourceId);
+      admissions.put(admissionKey, new AdmissionRecord(fingerprint, sessionId));
       state.activeWriteSessionId = sessionId;
-      return session;
+      return new SessionAdmission<>(session, false);
     }
   }
 
@@ -270,12 +308,25 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
   }
 
   @Override
-  public LiveReadSession beginLiveRead(String resourceId, String owner, Duration leaseDuration) {
-    requirePositiveDuration(leaseDuration);
+  public SessionAdmission<LiveReadSession> beginLiveRead(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey) {
+    requireBeginInputs(owner, leaseDuration, idempotencyKey);
     synchronized (monitor) {
       ResourceState state = requireResource(resourceId);
       Instant now = authoritativeClock.instant();
       expireSessions(state, now);
+      AdmissionKey admissionKey =
+          new AdmissionKey(resourceId, BeginOperation.LIVE_READ, idempotencyKey);
+      AdmissionFingerprint fingerprint = new AdmissionFingerprint(owner, leaseDuration);
+      AdmissionRecord priorAdmission = admissions.get(admissionKey);
+      if (priorAdmission != null) {
+        requireSameFingerprint(priorAdmission, fingerprint);
+        LiveReadSession priorSession = liveReadSessions.get(priorAdmission.sessionId());
+        if (priorSession == null) {
+          throw failure(ErrorCode.STORAGE_FAILURE, "Live-read admission history is inconsistent");
+        }
+        return new SessionAdmission<>(priorSession, true);
+      }
       if (state.activeWriteSessionId != null) {
         throw failure(ErrorCode.WRITE_IN_PROGRESS, "A write is active for " + resourceId);
       }
@@ -294,8 +345,9 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
               now);
       liveReadSessions.put(sessionId, session);
       liveReadResources.put(sessionId, resourceId);
+      admissions.put(admissionKey, new AdmissionRecord(fingerprint, sessionId));
       state.activeLiveReadSessionIds.add(sessionId);
-      return session;
+      return new SessionAdmission<>(session, false);
     }
   }
 
@@ -347,13 +399,25 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
   }
 
   @Override
-  public SnapshotGenerationSession beginSnapshot(
-      String resourceId, String owner, Duration leaseDuration) {
-    requirePositiveDuration(leaseDuration);
+  public SessionAdmission<SnapshotGenerationSession> beginSnapshot(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey) {
+    requireBeginInputs(owner, leaseDuration, idempotencyKey);
     synchronized (monitor) {
       ResourceState state = requireResource(resourceId);
       Instant now = authoritativeClock.instant();
       expireSessions(state, now);
+      AdmissionKey admissionKey =
+          new AdmissionKey(resourceId, BeginOperation.SNAPSHOT, idempotencyKey);
+      AdmissionFingerprint fingerprint = new AdmissionFingerprint(owner, leaseDuration);
+      AdmissionRecord priorAdmission = admissions.get(admissionKey);
+      if (priorAdmission != null) {
+        requireSameFingerprint(priorAdmission, fingerprint);
+        SnapshotGenerationSession priorSession = snapshotSessions.get(priorAdmission.sessionId());
+        if (priorSession == null) {
+          throw failure(ErrorCode.STORAGE_FAILURE, "Snapshot admission history is inconsistent");
+        }
+        return new SessionAdmission<>(priorSession, true);
+      }
       if (state.resource.policies().snapshotSupport() == SnapshotSupport.DISABLED) {
         throw failure(
             ErrorCode.SNAPSHOT_SUPPORT_DISABLED, "Snapshot support is disabled for " + resourceId);
@@ -362,10 +426,11 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
         throw failure(ErrorCode.WRITE_IN_PROGRESS, "A write is active for " + resourceId);
       }
       long activeVersion = requireActiveVersion(state);
-      if (state.snapshotSessionByVersion.containsKey(activeVersion)) {
+      if (state.activeSnapshotSessionId != null || state.snapshots.containsKey(activeVersion)) {
         throw failure(
             ErrorCode.SNAPSHOT_SESSION_ALREADY_EXISTS,
-            "A snapshot-generation session already exists for version " + activeVersion);
+            "An active snapshot-generation session or stored snapshot already exists for version "
+                + activeVersion);
       }
       UUID sessionId = nextSessionId();
       SnapshotGenerationSession session =
@@ -381,9 +446,9 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
               now);
       snapshotSessions.put(sessionId, session);
       snapshotResources.put(sessionId, resourceId);
-      state.snapshotSessionByVersion.put(activeVersion, sessionId);
+      admissions.put(admissionKey, new AdmissionRecord(fingerprint, sessionId));
       state.activeSnapshotSessionId = sessionId;
-      return session;
+      return new SessionAdmission<>(session, false);
     }
   }
 
@@ -457,7 +522,23 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
       requireSubmittable(session);
     }
 
-    StagedSnapshot staged = stage(upload);
+    StagedSnapshot staged;
+    try {
+      staged = stage(upload);
+    } catch (VersionGateException stagingFailure) {
+      synchronized (monitor) {
+        ResourceState state = requireSnapshotResource(sessionId);
+        Instant now = authoritativeClock.instant();
+        expireSessions(state, now);
+        SnapshotGenerationSession session = requireSnapshotSessionAndFence(sessionId, fencingToken);
+        if (session.status() == SnapshotGenerationStatus.INVALIDATED) {
+          throw failure(
+              ErrorCode.SNAPSHOT_INVALIDATED,
+              "Snapshot session " + sessionId + " was invalidated by a writer");
+        }
+      }
+      throw stagingFailure;
+    }
 
     synchronized (monitor) {
       ResourceState state = requireSnapshotResource(sessionId);
@@ -792,8 +873,8 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
   }
 
   private UUID nextSessionId() {
-    long current = nextSessionSequence;
-    nextSessionSequence = incrementSequence(current, "session identifier");
+    long current = backingState.nextSessionSequence;
+    backingState.nextSessionSequence = incrementSequence(current, "session identifier");
     return new UUID(0L, current);
   }
 
@@ -816,6 +897,22 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
     Objects.requireNonNull(duration, "leaseDuration is required");
     if (duration.isZero() || duration.isNegative()) {
       throw new IllegalArgumentException("leaseDuration must be positive");
+    }
+  }
+
+  private static void requireBeginInputs(
+      String owner, Duration leaseDuration, String idempotencyKey) {
+    DomainValidation.requireNonBlank(owner, "owner", DomainValidation.TEXT_MAX_LENGTH);
+    requirePositiveDuration(leaseDuration);
+    DomainValidation.requireIdempotencyKey(idempotencyKey);
+  }
+
+  private static void requireSameFingerprint(
+      AdmissionRecord priorAdmission, AdmissionFingerprint fingerprint) {
+    if (!priorAdmission.fingerprint().equals(fingerprint)) {
+      throw failure(
+          ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+          "The idempotency key was already used with a different owner or lease duration");
     }
   }
 
@@ -899,6 +996,45 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
     return new VersionGateException(code, message);
   }
 
+  /**
+   * Mutable backing state used to reconstruct the in-memory adapter without reusing its object.
+   *
+   * <p>The type deliberately exposes no state accessors. It is only a deterministic test analogue
+   * for reopening one authoritative persistence boundary.
+   */
+  public static final class BackingState {
+
+    private final Clock authoritativeClock;
+    private final Object monitor = new Object();
+    private final Map<String, ResourceState> resources = new HashMap<>();
+    private final Map<UUID, WriteSession> writeSessions = new HashMap<>();
+    private final Map<UUID, String> writeResources = new HashMap<>();
+    private final Map<UUID, LiveReadSession> liveReadSessions = new HashMap<>();
+    private final Map<UUID, String> liveReadResources = new HashMap<>();
+    private final Map<UUID, SnapshotGenerationSession> snapshotSessions = new HashMap<>();
+    private final Map<UUID, String> snapshotResources = new HashMap<>();
+    private final Map<AdmissionKey, AdmissionRecord> admissions = new HashMap<>();
+    private long nextSessionSequence = 1;
+
+    /** Creates empty backing state with one authoritative clock shared by every reconstruction. */
+    public BackingState(Clock authoritativeClock) {
+      this.authoritativeClock =
+          Objects.requireNonNull(authoritativeClock, "authoritativeClock is required");
+    }
+  }
+
+  private enum BeginOperation {
+    WRITE,
+    LIVE_READ,
+    SNAPSHOT
+  }
+
+  private record AdmissionKey(String resourceId, BeginOperation operation, String idempotencyKey) {}
+
+  private record AdmissionFingerprint(String owner, Duration leaseDuration) {}
+
+  private record AdmissionRecord(AdmissionFingerprint fingerprint, UUID sessionId) {}
+
   private static final class ResourceState {
     private Resource resource;
     private long nextVersion = 1;
@@ -906,7 +1042,6 @@ public final class InMemoryVersionGateStore implements VersionGateStore {
     private UUID activeWriteSessionId;
     private final Set<UUID> activeLiveReadSessionIds = new HashSet<>();
     private UUID activeSnapshotSessionId;
-    private final Map<Long, UUID> snapshotSessionByVersion = new HashMap<>();
     private final NavigableMap<Long, SnapshotData> snapshots = new TreeMap<>();
 
     private ResourceState(Resource resource) {

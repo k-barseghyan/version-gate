@@ -129,6 +129,7 @@ final class VersionGateExceptionHandler {
           CURRENT_SNAPSHOT_UNAVAILABLE ->
           HttpStatus.NOT_FOUND;
       case RESOURCE_ALREADY_EXISTS,
+          IDEMPOTENCY_KEY_CONFLICT,
           WRITE_ALREADY_ACTIVE,
           LIVE_READ_ACTIVE,
           SNAPSHOT_SESSION_ALREADY_EXISTS,

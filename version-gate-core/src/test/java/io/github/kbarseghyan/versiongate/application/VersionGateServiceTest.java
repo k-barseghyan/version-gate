@@ -13,12 +13,15 @@ import static org.mockito.Mockito.when;
 
 import io.github.kbarseghyan.versiongate.api.ErrorCode;
 import io.github.kbarseghyan.versiongate.api.VersionGateException;
+import io.github.kbarseghyan.versiongate.domain.LiveReadSession;
 import io.github.kbarseghyan.versiongate.domain.MissingCurrentSnapshotPolicy;
 import io.github.kbarseghyan.versiongate.domain.Resource;
 import io.github.kbarseghyan.versiongate.domain.ResourcePolicies;
 import io.github.kbarseghyan.versiongate.domain.RetrievalDuringWritePolicy;
+import io.github.kbarseghyan.versiongate.domain.SnapshotGenerationSession;
 import io.github.kbarseghyan.versiongate.domain.SnapshotSelector;
 import io.github.kbarseghyan.versiongate.domain.SnapshotSupport;
+import io.github.kbarseghyan.versiongate.domain.WriteSession;
 import io.github.kbarseghyan.versiongate.domain.WriterDuringSnapshotPolicy;
 import io.github.kbarseghyan.versiongate.port.VersionGateStore;
 import java.io.ByteArrayInputStream;
@@ -39,6 +42,7 @@ class VersionGateServiceTest {
   private static final long MAXIMUM_SNAPSHOT_SIZE = 1024;
   private static final UUID SESSION_ID = UUID.fromString("4dd965e8-4b5b-4bb1-bc58-bd95981f57f4");
   private static final long FENCING_TOKEN = 17;
+  private static final String IDEMPOTENCY_KEY = "request-1";
   private static final Instant NOW = Instant.parse("2030-01-02T03:04:05Z");
 
   private VersionGateStore store;
@@ -97,17 +101,44 @@ class VersionGateServiceTest {
   }
 
   @Test
+  void sessionLookupsReturnCurrentStateAndMapMissingSessions() {
+    WriteSession write = mock(WriteSession.class);
+    LiveReadSession read = mock(LiveReadSession.class);
+    SnapshotGenerationSession snapshot = mock(SnapshotGenerationSession.class);
+    UUID writeId = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    UUID readId = UUID.fromString("00000000-0000-0000-0000-000000000002");
+    UUID snapshotId = UUID.fromString("00000000-0000-0000-0000-000000000003");
+    UUID missingId = UUID.fromString("00000000-0000-0000-0000-000000000004");
+    when(store.findWriteSession(writeId)).thenReturn(Optional.of(write));
+    when(store.findLiveReadSession(readId)).thenReturn(Optional.of(read));
+    when(store.findSnapshotSession(snapshotId)).thenReturn(Optional.of(snapshot));
+    when(store.findWriteSession(missingId)).thenReturn(Optional.empty());
+
+    assertThat(service.getWriteSession(writeId)).isSameAs(write);
+    assertThat(service.getLiveReadSession(readId)).isSameAs(read);
+    assertThat(service.getSnapshotSession(snapshotId)).isSameAs(snapshot);
+    assertThatThrownBy(() -> service.getWriteSession(missingId))
+        .isInstanceOfSatisfying(
+            VersionGateException.class,
+            exception -> assertThat(exception.code()).isEqualTo(ErrorCode.WRITE_SESSION_NOT_FOUND));
+    assertValidationFailure(() -> service.getLiveReadSession(null));
+  }
+
+  @Test
   void beginOperationsDelegateWithoutApplicationLifecyclePrechecks() {
     Duration lease = Duration.ofMinutes(5);
 
-    service.beginWrite(new VersionGateService.BeginWriteCommand("catalog", "writer", lease));
-    service.beginLiveRead(new VersionGateService.BeginLiveReadCommand("catalog", "reader", lease));
+    service.beginWrite(
+        new VersionGateService.BeginWriteCommand("catalog", "writer", lease, IDEMPOTENCY_KEY));
+    service.beginLiveRead(
+        new VersionGateService.BeginLiveReadCommand("catalog", "reader", lease, IDEMPOTENCY_KEY));
     service.beginSnapshot(
-        new VersionGateService.BeginSnapshotCommand("catalog", "snapshotter", lease));
+        new VersionGateService.BeginSnapshotCommand(
+            "catalog", "snapshotter", lease, IDEMPOTENCY_KEY));
 
-    verify(store).beginWrite("catalog", "writer", lease);
-    verify(store).beginLiveRead("catalog", "reader", lease);
-    verify(store).beginSnapshot("catalog", "snapshotter", lease);
+    verify(store).beginWrite("catalog", "writer", lease, IDEMPOTENCY_KEY);
+    verify(store).beginLiveRead("catalog", "reader", lease, IDEMPOTENCY_KEY);
+    verify(store).beginSnapshot("catalog", "snapshotter", lease, IDEMPOTENCY_KEY);
     verifyNoMoreInteractions(store);
   }
 
@@ -115,13 +146,20 @@ class VersionGateServiceTest {
   void beginOperationsRejectInvalidIdentifiersOwnersAndLeases() {
     List<VersionGateService.BeginWriteCommand> invalid =
         List.of(
-            new VersionGateService.BeginWriteCommand("bad/id", "owner", Duration.ofMinutes(1)),
-            new VersionGateService.BeginWriteCommand("catalog", " ", Duration.ofMinutes(1)),
             new VersionGateService.BeginWriteCommand(
-                "catalog", "x".repeat(256), Duration.ofMinutes(1)),
-            new VersionGateService.BeginWriteCommand("catalog", "owner", Duration.ZERO),
+                "bad/id", "owner", Duration.ofMinutes(1), IDEMPOTENCY_KEY),
             new VersionGateService.BeginWriteCommand(
-                "catalog", "owner", MAXIMUM_LEASE.plusNanos(1)));
+                "catalog", " ", Duration.ofMinutes(1), IDEMPOTENCY_KEY),
+            new VersionGateService.BeginWriteCommand(
+                "catalog", "x".repeat(256), Duration.ofMinutes(1), IDEMPOTENCY_KEY),
+            new VersionGateService.BeginWriteCommand(
+                "catalog", "owner", Duration.ZERO, IDEMPOTENCY_KEY),
+            new VersionGateService.BeginWriteCommand(
+                "catalog", "owner", MAXIMUM_LEASE.plusNanos(1), IDEMPOTENCY_KEY),
+            new VersionGateService.BeginWriteCommand(
+                "catalog", "owner", Duration.ofMinutes(1), "bad key"),
+            new VersionGateService.BeginWriteCommand(
+                "catalog", "owner", Duration.ofMinutes(1), "x".repeat(129)));
 
     invalid.forEach(command -> assertValidationFailure(() -> service.beginWrite(command)));
     assertValidationFailure(() -> service.beginLiveRead(null));

@@ -9,6 +9,9 @@ public final class DomainValidation {
   /** Maximum number of characters accepted by a public identifier. */
   public static final int IDENTIFIER_MAX_LENGTH = 128;
 
+  /** Maximum number of characters accepted by an idempotency key. */
+  public static final int IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+
   /** Maximum number of characters accepted by bounded free-text fields. */
   public static final int TEXT_MAX_LENGTH = 255;
 
@@ -20,7 +23,11 @@ public final class DomainValidation {
    */
   public static final String IDENTIFIER_PATTERN = "[A-Za-z0-9][A-Za-z0-9._-]{0,127}";
 
+  /** Case-sensitive grammar for client-supplied idempotency keys. */
+  public static final String IDEMPOTENCY_KEY_PATTERN = "[A-Za-z0-9][A-Za-z0-9._:-]{0,127}";
+
   private static final Pattern IDENTIFIER = Pattern.compile(IDENTIFIER_PATTERN);
+  private static final Pattern IDEMPOTENCY_KEY = Pattern.compile(IDEMPOTENCY_KEY_PATTERN);
   private static final Pattern SHA_256 = Pattern.compile("[a-fA-F0-9]{64}");
 
   private DomainValidation() {}
@@ -38,6 +45,20 @@ public final class DomainValidation {
     requireNonBlank(value, name);
     if (!IDENTIFIER.matcher(value).matches()) {
       throw new IllegalArgumentException(name + " must match " + IDENTIFIER.pattern());
+    }
+    return value;
+  }
+
+  /**
+   * Requires a bounded, case-sensitive idempotency key without normalizing it.
+   *
+   * @param value idempotency key to validate
+   * @return the original valid key
+   */
+  public static String requireIdempotencyKey(String value) {
+    requireNonBlank(value, "idempotencyKey");
+    if (!IDEMPOTENCY_KEY.matcher(value).matches()) {
+      throw new IllegalArgumentException("idempotencyKey must match " + IDEMPOTENCY_KEY.pattern());
     }
     return value;
   }

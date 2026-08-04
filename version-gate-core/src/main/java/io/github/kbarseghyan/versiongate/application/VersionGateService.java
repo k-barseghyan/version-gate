@@ -73,9 +73,22 @@ public final class VersionGateService {
   }
 
   /** Begins an exclusive leased and fenced coordinated write. */
-  public WriteSession beginWrite(BeginWriteCommand command) {
+  public VersionGateStore.SessionAdmission<WriteSession> beginWrite(BeginWriteCommand command) {
     validateBegin(command, "command");
-    return store.beginWrite(command.resourceId(), command.owner(), command.leaseDuration());
+    return store.beginWrite(
+        command.resourceId(), command.owner(), command.leaseDuration(), command.idempotencyKey());
+  }
+
+  /** Returns the current durable state of one coordinated write session. */
+  public WriteSession getWriteSession(UUID sessionId) {
+    validateSessionId(sessionId);
+    return store
+        .findWriteSession(sessionId)
+        .orElseThrow(
+            () ->
+                new VersionGateException(
+                    ErrorCode.WRITE_SESSION_NOT_FOUND,
+                    "Write session " + sessionId + " was not found"));
   }
 
   /** Renews a coordinated write through the authoritative store. */
@@ -109,9 +122,23 @@ public final class VersionGateService {
   }
 
   /** Begins a leased live read bound by storage to the active version. */
-  public LiveReadSession beginLiveRead(BeginLiveReadCommand command) {
+  public VersionGateStore.SessionAdmission<LiveReadSession> beginLiveRead(
+      BeginLiveReadCommand command) {
     validateBegin(command, "command");
-    return store.beginLiveRead(command.resourceId(), command.owner(), command.leaseDuration());
+    return store.beginLiveRead(
+        command.resourceId(), command.owner(), command.leaseDuration(), command.idempotencyKey());
+  }
+
+  /** Returns the current durable state of one coordinated live-read session. */
+  public LiveReadSession getLiveReadSession(UUID sessionId) {
+    validateSessionId(sessionId);
+    return store
+        .findLiveReadSession(sessionId)
+        .orElseThrow(
+            () ->
+                new VersionGateException(
+                    ErrorCode.LIVE_READ_SESSION_NOT_FOUND,
+                    "Live-read session " + sessionId + " was not found"));
   }
 
   /** Renews a live-read session through the authoritative store. */
@@ -134,9 +161,23 @@ public final class VersionGateService {
   }
 
   /** Begins externally driven snapshot generation bound by storage to the active version. */
-  public SnapshotGenerationSession beginSnapshot(BeginSnapshotCommand command) {
+  public VersionGateStore.SessionAdmission<SnapshotGenerationSession> beginSnapshot(
+      BeginSnapshotCommand command) {
     validateBegin(command, "command");
-    return store.beginSnapshot(command.resourceId(), command.owner(), command.leaseDuration());
+    return store.beginSnapshot(
+        command.resourceId(), command.owner(), command.leaseDuration(), command.idempotencyKey());
+  }
+
+  /** Returns the current durable state of one snapshot-generation session. */
+  public SnapshotGenerationSession getSnapshotSession(UUID sessionId) {
+    validateSessionId(sessionId);
+    return store
+        .findSnapshotSession(sessionId)
+        .orElseThrow(
+            () ->
+                new VersionGateException(
+                    ErrorCode.SNAPSHOT_SESSION_NOT_FOUND,
+                    "Snapshot session " + sessionId + " was not found"));
   }
 
   /** Renews an active snapshot-generation session through the authoritative store. */
@@ -228,6 +269,7 @@ public final class VersionGateService {
           DomainValidation.requireNonBlank(
               command.owner(), "owner", DomainValidation.TEXT_MAX_LENGTH);
           requireValidLease(command.leaseDuration());
+          DomainValidation.requireIdempotencyKey(command.idempotencyKey());
         });
   }
 
@@ -278,6 +320,10 @@ public final class VersionGateService {
     if (fencingToken <= 0) {
       throw new IllegalArgumentException("fencingToken must be positive");
     }
+  }
+
+  private static void validateSessionId(UUID sessionId) {
+    validate(() -> Objects.requireNonNull(sessionId, "sessionId is required"));
   }
 
   private void requireValidLease(Duration leaseDuration) {
@@ -342,21 +388,26 @@ public final class VersionGateService {
     String owner();
 
     Duration leaseDuration();
+
+    String idempotencyKey();
   }
 
   /** Immutable resource-registration command. */
   public record RegisterResourceCommand(String resourceId, ResourcePolicies policies) {}
 
   /** Immutable coordinated-write admission command. */
-  public record BeginWriteCommand(String resourceId, String owner, Duration leaseDuration)
+  public record BeginWriteCommand(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey)
       implements BeginCommand {}
 
   /** Immutable live-read admission command. */
-  public record BeginLiveReadCommand(String resourceId, String owner, Duration leaseDuration)
+  public record BeginLiveReadCommand(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey)
       implements BeginCommand {}
 
   /** Immutable snapshot-generation admission command. */
-  public record BeginSnapshotCommand(String resourceId, String owner, Duration leaseDuration)
+  public record BeginSnapshotCommand(
+      String resourceId, String owner, Duration leaseDuration, String idempotencyKey)
       implements BeginCommand {}
 
   /** Immutable fenced session command. */

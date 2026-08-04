@@ -11,6 +11,9 @@ public enum ErrorCode {
   /** A resource with the requested identifier is already registered. */
   RESOURCE_ALREADY_EXISTS,
 
+  /** An idempotency key was reused for a different begin-operation request. */
+  IDEMPOTENCY_KEY_CONFLICT,
+
   /** The resource has no successfully completed write version. */
   ACTIVE_VERSION_NOT_FOUND,
 

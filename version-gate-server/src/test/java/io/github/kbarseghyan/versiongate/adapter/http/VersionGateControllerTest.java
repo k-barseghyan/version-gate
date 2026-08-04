@@ -38,6 +38,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -54,12 +55,14 @@ class VersionGateControllerTest {
 
   private InMemoryVersionGateStore store;
   private MockMvc mockMvc;
+  private long nextIdempotencyKey;
 
   @BeforeEach
   void setUp() {
     store = new InMemoryVersionGateStore(Clock.fixed(NOW, ZoneOffset.UTC));
     VersionGateService service = new VersionGateService(store, Duration.ofHours(1), 1024 * 1024);
     mockMvc = mockMvc(service);
+    nextIdempotencyKey = 1;
   }
 
   @Test
@@ -126,6 +129,10 @@ class VersionGateControllerTest {
 
     SessionToken write = begin("/resources/catalog/write-sessions", "writer");
     mockMvc
+        .perform(get("/write-sessions/{sessionId}", write.sessionId()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.sessionId").value(write.sessionId().toString()));
+    mockMvc
         .perform(
             post("/write-sessions/{sessionId}/renew", write.sessionId())
                 .header(VersionGateController.FENCING_TOKEN_HEADER, write.fencingToken())
@@ -142,6 +149,10 @@ class VersionGateControllerTest {
         .andExpect(jsonPath("$.activeVersion").value(1));
 
     SessionToken read = begin("/resources/catalog/live-read-sessions", "reader-one");
+    mockMvc
+        .perform(get("/live-read-sessions/{sessionId}", read.sessionId()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.sessionId").value(read.sessionId().toString()));
     mockMvc
         .perform(
             post("/live-read-sessions/{sessionId}/renew", read.sessionId())
@@ -182,6 +193,10 @@ class VersionGateControllerTest {
     activateFirstVersion("catalog");
 
     SessionToken generation = begin("/resources/catalog/snapshot-sessions", "snapshot-provider");
+    mockMvc
+        .perform(get("/snapshot-sessions/{sessionId}", generation.sessionId()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.sessionId").value(generation.sessionId().toString()));
     mockMvc
         .perform(
             post("/snapshot-sessions/{sessionId}/renew", generation.sessionId())
@@ -281,6 +296,115 @@ class VersionGateControllerTest {
   }
 
   @ParameterizedTest
+  @ValueSource(strings = {"*/*", "application/*", "application/*+json"})
+  void rejectsWildcardSnapshotContentTypesBeforePublication(String wildcardContentType)
+      throws Exception {
+    register(enabledResource("catalog", "CURRENT"));
+    activateFirstVersion("catalog");
+    SessionToken generation = begin("/resources/catalog/snapshot-sessions", "provider");
+    byte[] payload = "snapshot".getBytes(StandardCharsets.UTF_8);
+
+    mockMvc
+        .perform(
+            put("/snapshot-sessions/{sessionId}/snapshot", generation.sessionId())
+                .header(VersionGateController.FENCING_TOKEN_HEADER, generation.fencingToken())
+                .header(HttpHeaders.CONTENT_TYPE, wildcardContentType)
+                .content(payload))
+        .andExpect(status().isUnsupportedMediaType())
+        .andExpect(jsonPath("$.code").value("UNSUPPORTED_CONTENT_TYPE"));
+
+    mockMvc
+        .perform(get("/resources/catalog/snapshots/current"))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value("CURRENT_SNAPSHOT_UNAVAILABLE"));
+
+    mockMvc
+        .perform(
+            put("/snapshot-sessions/{sessionId}/snapshot", generation.sessionId())
+                .header(VersionGateController.FENCING_TOKEN_HEADER, generation.fencingToken())
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .content(payload))
+        .andExpect(status().isCreated())
+        .andExpect(jsonPath("$.snapshot.contentType").value("application/octet-stream"));
+  }
+
+  @Test
+  void beginSessionsRequireAtomicIdempotencyAndReplayThroughCanonicalLocation() throws Exception {
+    register(disabledResource("catalog"));
+    String request = "{\"owner\":\"writer\",\"leaseSeconds\":300}";
+
+    mockMvc
+        .perform(
+            post("/resources/catalog/write-sessions")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(request))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+    mockMvc
+        .perform(
+            post("/resources/catalog/write-sessions")
+                .header(VersionGateController.IDEMPOTENCY_KEY_HEADER, "invalid key")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(request))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+
+    MvcResult first =
+        mockMvc
+            .perform(
+                post("/resources/catalog/write-sessions")
+                    .header(VersionGateController.IDEMPOTENCY_KEY_HEADER, "write-request")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(request))
+            .andExpect(status().isCreated())
+            .andExpect(
+                header()
+                    .string(
+                        HttpHeaders.LOCATION,
+                        "http://localhost/write-sessions/00000000-0000-0000-0000-000000000001"))
+            .andReturn();
+    JsonNode firstBody = JSON_MAPPER.readTree(first.getResponse().getContentAsByteArray());
+
+    mockMvc
+        .perform(
+            post("/resources/catalog/write-sessions")
+                .header(VersionGateController.IDEMPOTENCY_KEY_HEADER, "write-request")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(request))
+        .andExpect(status().isOk())
+        .andExpect(
+            header()
+                .string(HttpHeaders.LOCATION, first.getResponse().getHeader(HttpHeaders.LOCATION)))
+        .andExpect(jsonPath("$.sessionId").value(firstBody.get("sessionId").stringValue()))
+        .andExpect(jsonPath("$.allocatedVersion").value(1));
+
+    mockMvc
+        .perform(get("/write-sessions/{sessionId}", firstBody.get("sessionId").stringValue()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.sessionId").value(firstBody.get("sessionId").stringValue()));
+
+    mockMvc
+        .perform(
+            post("/resources/catalog/write-sessions")
+                .header(VersionGateController.IDEMPOTENCY_KEY_HEADER, "write-request")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"owner\":\"other-writer\",\"leaseSeconds\":300}"))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("IDEMPOTENCY_KEY_CONFLICT"));
+  }
+
+  @Test
+  void liveReadAndSnapshotBeginsReplayWithOkAndTheOriginalLocationAndBody() throws Exception {
+    register(disabledResource("reads"));
+    activateFirstVersion("reads");
+    register(enabledResource("snapshots", "CURRENT"));
+    activateFirstVersion("snapshots");
+
+    assertBeginReplay("/resources/reads/live-read-sessions", "reader", "live-read-request");
+    assertBeginReplay("/resources/snapshots/snapshot-sessions", "snapshotter", "snapshot-request");
+  }
+
+  @ParameterizedTest
   @CsvSource({
     "VALIDATION_FAILED,400",
     "RESOURCE_NOT_FOUND,404",
@@ -291,6 +415,7 @@ class VersionGateControllerTest {
     "SNAPSHOT_NOT_FOUND,404",
     "CURRENT_SNAPSHOT_UNAVAILABLE,404",
     "RESOURCE_ALREADY_EXISTS,409",
+    "IDEMPOTENCY_KEY_CONFLICT,409",
     "WRITE_ALREADY_ACTIVE,409",
     "LIVE_READ_ACTIVE,409",
     "SNAPSHOT_SESSION_ALREADY_EXISTS,409",
@@ -383,6 +508,9 @@ class VersionGateControllerTest {
         mockMvc
             .perform(
                 post(path)
+                    .header(
+                        VersionGateController.IDEMPOTENCY_KEY_HEADER,
+                        "request-" + nextIdempotencyKey++)
                     .contentType(MediaType.APPLICATION_JSON)
                     .content(
                         """
@@ -395,6 +523,40 @@ class VersionGateControllerTest {
     JsonNode json = JSON_MAPPER.readTree(result.getResponse().getContentAsByteArray());
     return new SessionToken(
         UUID.fromString(json.get("sessionId").stringValue()), json.get("fencingToken").asLong());
+  }
+
+  private void assertBeginReplay(String path, String owner, String idempotencyKey)
+      throws Exception {
+    String request = "{\"owner\":\"%s\",\"leaseSeconds\":300}".formatted(owner);
+    MvcResult first =
+        mockMvc
+            .perform(
+                post(path)
+                    .header(VersionGateController.IDEMPOTENCY_KEY_HEADER, idempotencyKey)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(request))
+            .andExpect(status().isCreated())
+            .andExpect(header().exists(HttpHeaders.LOCATION))
+            .andReturn();
+    JsonNode firstBody = JSON_MAPPER.readTree(first.getResponse().getContentAsByteArray());
+
+    MvcResult replay =
+        mockMvc
+            .perform(
+                post(path)
+                    .header(VersionGateController.IDEMPOTENCY_KEY_HEADER, idempotencyKey)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(request))
+            .andExpect(status().isOk())
+            .andExpect(
+                header()
+                    .string(
+                        HttpHeaders.LOCATION, first.getResponse().getHeader(HttpHeaders.LOCATION)))
+            .andExpect(jsonPath("$.sessionId").value(firstBody.get("sessionId").stringValue()))
+            .andReturn();
+
+    assertThat(JSON_MAPPER.readTree(replay.getResponse().getContentAsByteArray()))
+        .isEqualTo(firstBody);
   }
 
   private org.springframework.test.web.servlet.ResultActions mutate(String path, SessionToken token)
@@ -437,30 +599,30 @@ class VersionGateControllerTest {
 
   private static String disabledResource(String resourceId) {
     return """
-        {
-          "resourceId": "%s",
-          "policies": {
-            "snapshotSupport": "DISABLED",
-            "missingCurrentSnapshotPolicy": "ALLOW_GAP"
-          }
-        }
-        """
+    {
+      "resourceId": "%s",
+      "policies": {
+        "snapshotSupport": "DISABLED",
+        "missingCurrentSnapshotPolicy": "ALLOW_GAP"
+      }
+    }
+    """
         .formatted(resourceId);
   }
 
   private static String enabledResource(String resourceId, String selector) {
     return """
-        {
-          "resourceId": "%s",
-          "policies": {
-            "snapshotSupport": "ENABLED",
-            "missingCurrentSnapshotPolicy": "ALLOW_GAP",
-            "writerDuringSnapshotPolicy": "BLOCK_WRITER",
-            "defaultSnapshotSelector": "%s",
-            "retrievalDuringWritePolicy": "ALLOW_WHILE_WRITING"
-          }
-        }
-        """
+    {
+      "resourceId": "%s",
+      "policies": {
+        "snapshotSupport": "ENABLED",
+        "missingCurrentSnapshotPolicy": "ALLOW_GAP",
+        "writerDuringSnapshotPolicy": "BLOCK_WRITER",
+        "defaultSnapshotSelector": "%s",
+        "retrievalDuringWritePolicy": "ALLOW_WHILE_WRITING"
+      }
+    }
+    """
         .formatted(resourceId, selector);
   }
 

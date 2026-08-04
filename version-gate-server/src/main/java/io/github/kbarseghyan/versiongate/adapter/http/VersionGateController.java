@@ -55,6 +55,7 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 final class VersionGateController {
 
   static final String FENCING_TOKEN_HEADER = "X-Fencing-Token";
+  static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
   static final String CHECKSUM_HEADER = "X-Checksum-SHA256";
   static final String SNAPSHOT_VERSION_HEADER = "X-Snapshot-Version";
   static final String ACTIVE_VERSION_HEADER = "X-Active-Version";
@@ -92,9 +93,20 @@ final class VersionGateController {
   @Operation(summary = "Begin a coordinated write")
   ResponseEntity<WriteSession> beginWrite(
       @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
+      @RequestHeader(IDEMPOTENCY_KEY_HEADER)
+          @Pattern(regexp = DomainValidation.IDEMPOTENCY_KEY_PATTERN)
+          String idempotencyKey,
       @Valid @RequestBody BeginSessionRequest request) {
-    WriteSession session = service.beginWrite(request.toWriteCommand(resourceId));
-    return createdSession("/write-sessions/{sessionId}", session.sessionId(), session);
+    VersionGateStore.SessionAdmission<WriteSession> admission =
+        service.beginWrite(request.toWriteCommand(resourceId, idempotencyKey));
+    return sessionResponse(
+        "/write-sessions/{sessionId}", admission.session().sessionId(), admission);
+  }
+
+  @GetMapping(path = "/write-sessions/{sessionId}", produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Get a coordinated write session")
+  WriteSession getWriteSession(@PathVariable UUID sessionId) {
+    return service.getWriteSession(sessionId);
   }
 
   @PostMapping(
@@ -148,9 +160,20 @@ final class VersionGateController {
   @Operation(summary = "Begin a coordinated live read")
   ResponseEntity<LiveReadSession> beginLiveRead(
       @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
+      @RequestHeader(IDEMPOTENCY_KEY_HEADER)
+          @Pattern(regexp = DomainValidation.IDEMPOTENCY_KEY_PATTERN)
+          String idempotencyKey,
       @Valid @RequestBody BeginSessionRequest request) {
-    LiveReadSession session = service.beginLiveRead(request.toLiveReadCommand(resourceId));
-    return createdSession("/live-read-sessions/{sessionId}", session.sessionId(), session);
+    VersionGateStore.SessionAdmission<LiveReadSession> admission =
+        service.beginLiveRead(request.toLiveReadCommand(resourceId, idempotencyKey));
+    return sessionResponse(
+        "/live-read-sessions/{sessionId}", admission.session().sessionId(), admission);
+  }
+
+  @GetMapping(path = "/live-read-sessions/{sessionId}", produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Get a coordinated live-read session")
+  LiveReadSession getLiveReadSession(@PathVariable UUID sessionId) {
+    return service.getLiveReadSession(sessionId);
   }
 
   @PostMapping(
@@ -192,10 +215,20 @@ final class VersionGateController {
   @Operation(summary = "Begin externally performed snapshot generation")
   ResponseEntity<SnapshotGenerationSession> beginSnapshot(
       @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
+      @RequestHeader(IDEMPOTENCY_KEY_HEADER)
+          @Pattern(regexp = DomainValidation.IDEMPOTENCY_KEY_PATTERN)
+          String idempotencyKey,
       @Valid @RequestBody BeginSessionRequest request) {
-    SnapshotGenerationSession session =
-        service.beginSnapshot(request.toSnapshotCommand(resourceId));
-    return createdSession("/snapshot-sessions/{sessionId}", session.sessionId(), session);
+    VersionGateStore.SessionAdmission<SnapshotGenerationSession> admission =
+        service.beginSnapshot(request.toSnapshotCommand(resourceId, idempotencyKey));
+    return sessionResponse(
+        "/snapshot-sessions/{sessionId}", admission.session().sessionId(), admission);
+  }
+
+  @GetMapping(path = "/snapshot-sessions/{sessionId}", produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Get a snapshot-generation session")
+  SnapshotGenerationSession getSnapshotSession(@PathVariable UUID sessionId) {
+    return service.getSnapshotSession(sessionId);
   }
 
   @PostMapping(
@@ -320,13 +353,17 @@ final class VersionGateController {
     return new VersionGateService.SessionCommand(sessionId, fencingToken);
   }
 
-  private static <T> ResponseEntity<T> createdSession(String path, UUID sessionId, T session) {
+  private static <T> ResponseEntity<T> sessionResponse(
+      String path, UUID sessionId, VersionGateStore.SessionAdmission<T> admission) {
+    T session = admission.session();
     URI location =
         ServletUriComponentsBuilder.fromCurrentContextPath()
             .path(path)
             .buildAndExpand(sessionId)
             .toUri();
-    return ResponseEntity.created(location).body(session);
+    return ResponseEntity.status(admission.replayed() ? HttpStatus.OK : HttpStatus.CREATED)
+        .location(location)
+        .body(session);
   }
 
   private static long requireContentLength(HttpServletRequest request) {
@@ -345,7 +382,11 @@ final class VersionGateController {
       throw unsupportedContentType("Snapshot submission requires a Content-Type header");
     }
     try {
-      return MediaType.parseMediaType(value).toString();
+      MediaType mediaType = MediaType.parseMediaType(value);
+      if (mediaType.isWildcardType() || mediaType.isWildcardSubtype()) {
+        throw unsupportedContentType("Snapshot Content-Type must be concrete");
+      }
+      return mediaType.toString();
     } catch (IllegalArgumentException exception) {
       throw unsupportedContentType("Snapshot Content-Type is invalid");
     }
@@ -367,7 +408,11 @@ final class VersionGateController {
 
   private static MediaType requireStoredContentType(String value) {
     try {
-      return MediaType.parseMediaType(value);
+      MediaType mediaType = MediaType.parseMediaType(value);
+      if (mediaType.isWildcardType() || mediaType.isWildcardSubtype()) {
+        throw new IllegalArgumentException("Stored Content-Type must be concrete");
+      }
+      return mediaType;
     } catch (IllegalArgumentException exception) {
       throw new VersionGateException(
           ErrorCode.STORAGE_FAILURE, "Stored Content-Type metadata is invalid", exception);
@@ -445,19 +490,21 @@ final class VersionGateController {
 
   record BeginSessionRequest(@NotBlank String owner, @NotNull @Positive Long leaseSeconds) {
 
-    VersionGateService.BeginWriteCommand toWriteCommand(String resourceId) {
+    VersionGateService.BeginWriteCommand toWriteCommand(String resourceId, String idempotencyKey) {
       return new VersionGateService.BeginWriteCommand(
-          resourceId, owner, Duration.ofSeconds(leaseSeconds));
+          resourceId, owner, Duration.ofSeconds(leaseSeconds), idempotencyKey);
     }
 
-    VersionGateService.BeginLiveReadCommand toLiveReadCommand(String resourceId) {
+    VersionGateService.BeginLiveReadCommand toLiveReadCommand(
+        String resourceId, String idempotencyKey) {
       return new VersionGateService.BeginLiveReadCommand(
-          resourceId, owner, Duration.ofSeconds(leaseSeconds));
+          resourceId, owner, Duration.ofSeconds(leaseSeconds), idempotencyKey);
     }
 
-    VersionGateService.BeginSnapshotCommand toSnapshotCommand(String resourceId) {
+    VersionGateService.BeginSnapshotCommand toSnapshotCommand(
+        String resourceId, String idempotencyKey) {
       return new VersionGateService.BeginSnapshotCommand(
-          resourceId, owner, Duration.ofSeconds(leaseSeconds));
+          resourceId, owner, Duration.ofSeconds(leaseSeconds), idempotencyKey);
     }
   }
 
