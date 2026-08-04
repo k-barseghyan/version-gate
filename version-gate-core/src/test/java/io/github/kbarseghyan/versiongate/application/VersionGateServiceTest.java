@@ -125,15 +125,7 @@ class VersionGateServiceTest {
             NOW);
     LiveReadSession read =
         new LiveReadSession(
-            readId,
-            "catalog",
-            1,
-            LiveReadStatus.READING,
-            "reader",
-            2,
-            leaseExpiresAt,
-            NOW,
-            NOW);
+            readId, "catalog", 1, LiveReadStatus.READING, "reader", 2, leaseExpiresAt, NOW, NOW);
     SnapshotGenerationSession snapshot =
         new SnapshotGenerationSession(
             snapshotId,
