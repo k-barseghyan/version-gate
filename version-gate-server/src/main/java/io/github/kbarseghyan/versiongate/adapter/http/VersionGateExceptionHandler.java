@@ -35,8 +35,7 @@ final class VersionGateExceptionHandler {
   ResponseEntity<ProblemDetail> handleVersionGateException(
       VersionGateException exception, HttpServletRequest request) {
     HttpStatus status = statusFor(exception.code());
-    if (exception.code() == ErrorCode.STORAGE_FAILURE
-        || exception.code() == ErrorCode.SNAPSHOT_OBJECT_MISSING) {
+    if (exception.code() == ErrorCode.STORAGE_FAILURE) {
       String correlationId = UUID.randomUUID().toString();
       LOGGER.error("Storage dependency failure; correlationId={}", correlationId, exception);
       ProblemDetail problem =
@@ -121,20 +120,30 @@ final class VersionGateExceptionHandler {
 
   private static HttpStatus statusFor(ErrorCode code) {
     return switch (code) {
-      case RESOURCE_NOT_FOUND, BUILD_NOT_FOUND, VERSION_NOT_FOUND, COMPONENT_NOT_FOUND ->
+      case RESOURCE_NOT_FOUND,
+          ACTIVE_VERSION_NOT_FOUND,
+          WRITE_SESSION_NOT_FOUND,
+          LIVE_READ_SESSION_NOT_FOUND,
+          SNAPSHOT_SESSION_NOT_FOUND,
+          SNAPSHOT_NOT_FOUND,
+          CURRENT_SNAPSHOT_UNAVAILABLE ->
           HttpStatus.NOT_FOUND;
       case RESOURCE_ALREADY_EXISTS,
-          BUILD_ALREADY_EXISTS,
-          VERSION_ALREADY_EXISTS,
-          COMPONENT_CONFLICT,
-          INVALID_BUILD_TRANSITION,
+          WRITE_ALREADY_ACTIVE,
+          LIVE_READ_ACTIVE,
+          SNAPSHOT_SESSION_ALREADY_EXISTS,
+          SNAPSHOT_GENERATION_ACTIVE,
+          SNAPSHOT_SUPPORT_DISABLED,
+          CURRENT_SNAPSHOT_REQUIRED,
+          SNAPSHOT_INVALIDATED,
+          WRITE_IN_PROGRESS,
+          SNAPSHOT_CONFLICT,
           LEASE_EXPIRED,
-          ACTIVATION_CONFLICT ->
+          INVALID_SESSION_TRANSITION ->
           HttpStatus.CONFLICT;
       case STALE_FENCING_TOKEN -> HttpStatus.PRECONDITION_FAILED;
-      case CHECKSUM_MISMATCH, INCOMPLETE_SNAPSHOT -> HttpStatus.UNPROCESSABLE_CONTENT;
-      case PARTICIPANT_FAILURE -> HttpStatus.BAD_GATEWAY;
-      case SNAPSHOT_OBJECT_MISSING, STORAGE_FAILURE -> HttpStatus.SERVICE_UNAVAILABLE;
+      case CHECKSUM_MISMATCH -> HttpStatus.UNPROCESSABLE_CONTENT;
+      case STORAGE_FAILURE -> HttpStatus.SERVICE_UNAVAILABLE;
       case VALIDATION_FAILED -> HttpStatus.BAD_REQUEST;
     };
   }

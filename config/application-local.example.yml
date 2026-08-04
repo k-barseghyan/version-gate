@@ -1,6 +1,6 @@
 # Server configuration example. Adapter settings belong to their own namespaces.
-# The placeholder adapter modules do not yet provide ControlStore or SnapshotStore
-# beans, so a local composition must supply them explicitly.
+# The placeholder adapter modules do not yet provide a VersionGateStore bean, so a
+# local composition must supply one explicitly.
 
 spring:
   lifecycle:
@@ -22,11 +22,4 @@ management:
 
 version-gate:
   maximum-lease: ${VERSION_GATE_MAXIMUM_LEASE:PT1H}
-  maximum-component-size: ${VERSION_GATE_MAXIMUM_COMPONENT_SIZE:1GB}
-  maximum-participants-per-resource: ${VERSION_GATE_MAXIMUM_PARTICIPANTS:8}
-  expired-build-sweep-interval: ${VERSION_GATE_SWEEP_INTERVAL:PT30S}
-  participant:
-    connect-timeout: ${VERSION_GATE_PARTICIPANT_CONNECT_TIMEOUT:PT5S}
-    request-timeout: ${VERSION_GATE_PARTICIPANT_REQUEST_TIMEOUT:PT30S}
-    allowed-base-uris: ${VERSION_GATE_PARTICIPANT_ALLOWED_BASE_URIS:}
-    allow-http: ${VERSION_GATE_PARTICIPANT_ALLOW_HTTP:false}
+  maximum-snapshot-size: ${VERSION_GATE_MAXIMUM_SNAPSHOT_SIZE:1GB}

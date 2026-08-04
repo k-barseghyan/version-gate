@@ -12,9 +12,6 @@ public final class DomainValidation {
   /** Maximum number of characters accepted by bounded free-text fields. */
   public static final int TEXT_MAX_LENGTH = 255;
 
-  /** Hard safety limit for coordinated participants registered to one resource. */
-  public static final int MAX_PARTICIPANTS_PER_RESOURCE = 32;
-
   /**
    * Regular expression for path-safe public identifiers.
    *

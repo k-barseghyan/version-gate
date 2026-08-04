@@ -7,8 +7,8 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 /**
  * Bootstrap for the assembled Version Gate server.
  *
- * <p>Startup intentionally fails when the selected adapter modules provide no compatible storage
- * beans.
+ * <p>Startup intentionally fails when the selected adapter modules provide no compatible {@code
+ * VersionGateStore} bean.
  */
 @SpringBootConfiguration
 @EnableAutoConfiguration

@@ -6,8 +6,8 @@ import org.springframework.context.annotation.Import;
 /**
  * Spring Boot entry point that composes the core and selected adapter artifacts.
  *
- * <p>The auto-configuration intentionally fails fast when the application supplies neither a
- * control-store nor a snapshot-store adapter.
+ * <p>The auto-configuration intentionally fails fast when the application supplies no compatible
+ * {@code VersionGateStore} adapter.
  */
 @AutoConfiguration
 @Import(VersionGateConfiguration.class)

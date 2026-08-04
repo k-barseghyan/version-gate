@@ -4,50 +4,73 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
 import io.github.kbarseghyan.versiongate.application.VersionGateService;
-import io.github.kbarseghyan.versiongate.port.ControlStore;
-import io.github.kbarseghyan.versiongate.port.SnapshotStore;
+import io.github.kbarseghyan.versiongate.port.VersionGateStore;
+import java.net.http.HttpClient;
+import java.time.Clock;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
-import tools.jackson.databind.json.JsonMapper;
 
 class VersionGateAutoConfigurationTest {
 
   private final ApplicationContextRunner contextRunner =
-      new ApplicationContextRunner()
-          .withUserConfiguration(VersionGateAutoConfiguration.class)
-          .withBean(JsonMapper.class, () -> JsonMapper.builder().findAndAddModules().build());
+      new ApplicationContextRunner().withUserConfiguration(VersionGateAutoConfiguration.class);
 
   @Test
-  void composesTheCoreFromExternalPortBeansWithoutComponentScanning() {
+  void composesTheFourFlowServerFromExactlyOneAuthoritativeStore() {
     contextRunner
-        .withBean(ControlStore.class, () -> mock(ControlStore.class))
-        .withBean(SnapshotStore.class, () -> mock(SnapshotStore.class))
+        .withBean(VersionGateStore.class, () -> mock(VersionGateStore.class))
         .run(
             context -> {
               assertThat(context).hasNotFailed();
+              assertThat(context).hasSingleBean(VersionGateStore.class);
               assertThat(context).hasSingleBean(VersionGateService.class);
               assertThat(context).hasBean("versionGateController");
               assertThat(context).hasBean("versionGateExceptionHandler");
-              assertThat(context).hasBean("participantGateway");
+              assertThat(context).doesNotHaveBean("participantGateway");
+              assertThat(context).doesNotHaveBean("participantHttpClient");
+              assertThat(context).doesNotHaveBean("expiredBuildSweeper");
+              assertThat(context).doesNotHaveBean(Clock.class);
+              assertThat(context).doesNotHaveBean(HttpClient.class);
 
               VersionGateProperties properties = context.getBean(VersionGateProperties.class);
               assertThat(properties.maximumLease()).isEqualTo(Duration.ofHours(1));
-              assertThat(properties.maximumComponentSize().toBytes())
-                  .isEqualTo(1024L * 1024 * 1024);
-              assertThat(properties.maximumParticipantsPerResource()).isEqualTo(8);
-              assertThat(properties.participant().allowedBaseUris()).isEmpty();
+              assertThat(properties.maximumSnapshotSize().toBytes()).isEqualTo(1024L * 1024 * 1024);
             });
   }
 
   @Test
-  void failsFastWhenAStoragePortIsMissing() {
+  void bindsExplicitTechnicalLimits() {
     contextRunner
-        .withBean(ControlStore.class, () -> mock(ControlStore.class))
+        .withBean(VersionGateStore.class, () -> mock(VersionGateStore.class))
+        .withPropertyValues(
+            "version-gate.maximum-lease=PT10M", "version-gate.maximum-snapshot-size=64MB")
+        .run(
+            context -> {
+              VersionGateProperties properties = context.getBean(VersionGateProperties.class);
+              assertThat(properties.maximumLease()).isEqualTo(Duration.ofMinutes(10));
+              assertThat(properties.maximumSnapshotSize().toBytes()).isEqualTo(64L * 1024 * 1024);
+            });
+  }
+
+  @Test
+  void failsFastWhenTheAuthoritativeStoreIsMissing() {
+    contextRunner.run(
+        context -> {
+          assertThat(context).hasFailed();
+          assertThat(context.getStartupFailure()).hasMessageContaining("VersionGateStore");
+        });
+  }
+
+  @Test
+  void failsFastWhenMoreThanOneAuthoritativeStoreIsSupplied() {
+    contextRunner
+        .withBean("firstStore", VersionGateStore.class, () -> mock(VersionGateStore.class))
+        .withBean("secondStore", VersionGateStore.class, () -> mock(VersionGateStore.class))
         .run(
             context -> {
               assertThat(context).hasFailed();
-              assertThat(context.getStartupFailure()).hasMessageContaining("SnapshotStore");
+              assertThat(context.getStartupFailure()).hasMessageContaining("VersionGateStore");
             });
   }
 }

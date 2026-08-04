@@ -3,39 +3,33 @@ package io.github.kbarseghyan.versiongate.adapter.http;
 import io.github.kbarseghyan.versiongate.api.ErrorCode;
 import io.github.kbarseghyan.versiongate.api.VersionGateException;
 import io.github.kbarseghyan.versiongate.application.VersionGateService;
-import io.github.kbarseghyan.versiongate.domain.Build;
 import io.github.kbarseghyan.versiongate.domain.DomainValidation;
-import io.github.kbarseghyan.versiongate.domain.Participant;
+import io.github.kbarseghyan.versiongate.domain.LiveReadSession;
+import io.github.kbarseghyan.versiongate.domain.MissingCurrentSnapshotPolicy;
 import io.github.kbarseghyan.versiongate.domain.Resource;
-import io.github.kbarseghyan.versiongate.domain.SnapshotComponent;
-import io.github.kbarseghyan.versiongate.domain.SnapshotPolicy;
-import io.github.kbarseghyan.versiongate.domain.VersionManifest;
+import io.github.kbarseghyan.versiongate.domain.ResourcePolicies;
+import io.github.kbarseghyan.versiongate.domain.RetrievalDuringWritePolicy;
+import io.github.kbarseghyan.versiongate.domain.SnapshotGenerationSession;
+import io.github.kbarseghyan.versiongate.domain.SnapshotSelector;
+import io.github.kbarseghyan.versiongate.domain.SnapshotSupport;
+import io.github.kbarseghyan.versiongate.domain.StoredSnapshot;
+import io.github.kbarseghyan.versiongate.domain.WriteSession;
+import io.github.kbarseghyan.versiongate.domain.WriterDuringSnapshotPolicy;
+import io.github.kbarseghyan.versiongate.port.VersionGateStore;
 import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.Parameter;
-import io.swagger.v3.oas.annotations.enums.ParameterIn;
-import io.swagger.v3.oas.annotations.media.Content;
-import io.swagger.v3.oas.annotations.media.Schema;
-import io.swagger.v3.oas.annotations.responses.ApiResponse;
-import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
-import jakarta.validation.constraints.Size;
 import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
-import java.time.Instant;
-import java.time.format.DateTimeParseException;
-import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
-import java.util.Set;
+import java.util.OptionalLong;
 import java.util.UUID;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -49,19 +43,22 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
+/** HTTP boundary for coordinated writes, live reads, snapshot generation, and snapshot reads. */
 @RestController
 @RequestMapping
-@Tag(name = "Version Gate", description = "Coordinate and publish immutable snapshot versions")
+@Tag(name = "Version Gate", description = "Coordinate coherent distributed writes and reads")
 final class VersionGateController {
 
   static final String FENCING_TOKEN_HEADER = "X-Fencing-Token";
   static final String CHECKSUM_HEADER = "X-Checksum-SHA256";
-  static final String SCHEMA_VERSION_HEADER = "X-Schema-Version";
-  static final String CAPTURED_AT_HEADER = "X-Captured-At";
+  static final String SNAPSHOT_VERSION_HEADER = "X-Snapshot-Version";
+  static final String ACTIVE_VERSION_HEADER = "X-Active-Version";
+  static final String SNAPSHOT_STALE_HEADER = "X-Snapshot-Stale";
 
   private final VersionGateService service;
 
@@ -70,12 +67,7 @@ final class VersionGateController {
   }
 
   @PostMapping(path = "/resources", consumes = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Register a versioned resource")
-  @ApiResponses({
-    @ApiResponse(responseCode = "201", description = "Resource registered"),
-    @ApiResponse(responseCode = "400", description = "Request validation failed"),
-    @ApiResponse(responseCode = "409", description = "Resource already exists")
-  })
+  @Operation(summary = "Register a coordinated resource and its explicit policies")
   ResponseEntity<Resource> registerResource(@Valid @RequestBody RegisterResourceRequest request) {
     Resource resource = service.registerResource(request.toCommand());
     URI location =
@@ -88,298 +80,253 @@ final class VersionGateController {
 
   @GetMapping(path = "/resources/{resourceId}", produces = MediaType.APPLICATION_JSON_VALUE)
   @Operation(summary = "Get a registered resource")
-  @ApiResponses({
-    @ApiResponse(responseCode = "200", description = "Resource returned"),
-    @ApiResponse(responseCode = "404", description = "Resource not found")
-  })
   Resource getResource(
       @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId) {
     return service.getResource(resourceId);
   }
 
-  @PostMapping(path = "/resources/{resourceId}/builds", consumes = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Begin construction of a resource version")
-  @ApiResponses({
-    @ApiResponse(responseCode = "201", description = "Build created"),
-    @ApiResponse(responseCode = "400", description = "Request validation failed"),
-    @ApiResponse(responseCode = "404", description = "Resource not found"),
-    @ApiResponse(responseCode = "409", description = "A build or version already exists")
-  })
-  ResponseEntity<Build> beginBuild(
-      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
-      @Valid @RequestBody BeginBuildRequest request) {
-    Build build = service.beginBuild(request.toCommand(resourceId));
-    URI location =
-        ServletUriComponentsBuilder.fromCurrentRequest().path("/current").build().toUri();
-    return ResponseEntity.created(location).body(build);
-  }
-
-  @GetMapping(
-      path = "/resources/{resourceId}/builds/current",
+  @PostMapping(
+      path = "/resources/{resourceId}/write-sessions",
+      consumes = MediaType.APPLICATION_JSON_VALUE,
       produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Get the current non-terminal build")
-  @ApiResponses({
-    @ApiResponse(responseCode = "200", description = "Current build returned"),
-    @ApiResponse(responseCode = "404", description = "Resource or current build not found")
-  })
-  Build getCurrentBuild(
-      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId) {
-    return service
-        .getCurrentBuild(resourceId)
-        .orElseThrow(
-            () ->
-                new VersionGateException(
-                    ErrorCode.BUILD_NOT_FOUND, "Resource " + resourceId + " has no current build"));
+  @Operation(summary = "Begin a coordinated write")
+  ResponseEntity<WriteSession> beginWrite(
+      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
+      @Valid @RequestBody BeginSessionRequest request) {
+    WriteSession session = service.beginWrite(request.toWriteCommand(resourceId));
+    return createdSession("/write-sessions/{sessionId}", session.sessionId(), session);
   }
 
   @PostMapping(
-      path = "/builds/{buildId}/renew",
+      path = "/write-sessions/{sessionId}/renew",
       consumes = MediaType.APPLICATION_JSON_VALUE,
       produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Renew a build lease")
-  Build renewBuild(
-      @PathVariable UUID buildId,
-      @Parameter(
-              name = FENCING_TOKEN_HEADER,
-              description = "Current build ownership generation",
-              required = true,
-              schema = @Schema(type = "integer", format = "int64", minimum = "1"))
-          @RequestHeader(FENCING_TOKEN_HEADER)
-          long fencingToken,
-      @Valid @RequestBody RenewBuildRequest request) {
-    return service.renewBuild(request.toCommand(buildId, fencingToken));
+  @Operation(summary = "Renew a coordinated write lease")
+  WriteSession renewWrite(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken,
+      @Valid @RequestBody RenewSessionRequest request) {
+    return service.renewWrite(request.toCommand(sessionId, fencingToken));
   }
 
-  @PostMapping(path = "/builds/{buildId}/snapshot", produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Start the snapshot phase")
-  Build startSnapshotPhase(
-      @PathVariable UUID buildId,
-      @Parameter(
-              name = FENCING_TOKEN_HEADER,
-              description = "Current build ownership generation",
-              required = true,
-              schema = @Schema(type = "integer", format = "int64", minimum = "1"))
-          @RequestHeader(FENCING_TOKEN_HEADER)
-          long fencingToken) {
-    return service.startSnapshotPhase(
-        new VersionGateService.BuildTokenCommand(buildId, fencingToken));
+  @PostMapping(
+      path = "/write-sessions/{sessionId}/complete",
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Complete a write and immediately activate its version")
+  WriteSession completeWrite(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken) {
+    return service.completeWrite(sessionCommand(sessionId, fencingToken));
   }
 
-  @PutMapping(path = "/builds/{buildId}/components/{componentId}")
-  @Operation(
-      summary = "Stream an immutable snapshot component",
-      parameters = {
-        @Parameter(
-            name = HttpHeaders.CONTENT_LENGTH,
-            in = ParameterIn.HEADER,
-            required = true,
-            schema = @Schema(type = "integer", format = "int64", minimum = "0")),
-        @Parameter(
-            name = CHECKSUM_HEADER,
-            in = ParameterIn.HEADER,
-            description = "Optional hexadecimal SHA-256 of the transmitted bytes",
-            schema = @Schema(type = "string", pattern = "^[a-fA-F0-9]{64}$")),
-        @Parameter(
-            name = HttpHeaders.CONTENT_ENCODING,
-            in = ParameterIn.HEADER,
-            description = "Optional content encoding recorded in the manifest"),
-        @Parameter(
-            name = SCHEMA_VERSION_HEADER,
-            in = ParameterIn.HEADER,
-            description = "Optional producer-defined schema version"),
-        @Parameter(
-            name = CAPTURED_AT_HEADER,
-            in = ParameterIn.HEADER,
-            description = "Optional snapshot capture time",
-            schema = @Schema(type = "string", format = "date-time"))
-      },
-      requestBody =
-          @io.swagger.v3.oas.annotations.parameters.RequestBody(
-              required = true,
-              content = {
-                @Content(
-                    mediaType = MediaType.APPLICATION_JSON_VALUE,
-                    schema = @Schema(type = "string", format = "binary")),
-                @Content(
-                    mediaType = "application/x-ndjson",
-                    schema = @Schema(type = "string", format = "binary")),
-                @Content(
-                    mediaType = MediaType.APPLICATION_OCTET_STREAM_VALUE,
-                    schema = @Schema(type = "string", format = "binary"))
-              }))
-  @ApiResponses({
-    @ApiResponse(responseCode = "201", description = "Component stored"),
-    @ApiResponse(responseCode = "400", description = "Header or checksum is invalid"),
-    @ApiResponse(responseCode = "404", description = "Build or resource not found"),
-    @ApiResponse(
-        responseCode = "409",
-        description = "Component conflicts or build state is invalid"),
-    @ApiResponse(responseCode = "411", description = "Content-Length is required"),
-    @ApiResponse(responseCode = "412", description = "Fencing token is stale"),
-    @ApiResponse(responseCode = "415", description = "Content-Type is unsupported"),
-    @ApiResponse(responseCode = "422", description = "Supplied checksum does not match"),
-    @ApiResponse(responseCode = "503", description = "Snapshot storage is unavailable")
-  })
-  ResponseEntity<SnapshotComponent> submitSnapshotComponent(
-      @PathVariable UUID buildId,
-      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String componentId,
-      @Parameter(
-              name = FENCING_TOKEN_HEADER,
-              description = "Current build ownership generation",
-              required = true,
-              schema = @Schema(type = "integer", format = "int64", minimum = "1"))
-          @RequestHeader(FENCING_TOKEN_HEADER)
-          long fencingToken,
+  @PostMapping(
+      path = "/write-sessions/{sessionId}/fail",
+      consumes = MediaType.APPLICATION_JSON_VALUE,
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Fail a coordinated write without activating its version")
+  WriteSession failWrite(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken,
+      @Valid @RequestBody FailWriteRequest request) {
+    return service.failWrite(request.toCommand(sessionId, fencingToken));
+  }
+
+  @PostMapping(
+      path = "/write-sessions/{sessionId}/abandon",
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Abandon a coordinated write without activating its version")
+  WriteSession abandonWrite(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken) {
+    return service.abandonWrite(sessionCommand(sessionId, fencingToken));
+  }
+
+  @PostMapping(
+      path = "/resources/{resourceId}/live-read-sessions",
+      consumes = MediaType.APPLICATION_JSON_VALUE,
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Begin a coordinated live read")
+  ResponseEntity<LiveReadSession> beginLiveRead(
+      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
+      @Valid @RequestBody BeginSessionRequest request) {
+    LiveReadSession session = service.beginLiveRead(request.toLiveReadCommand(resourceId));
+    return createdSession("/live-read-sessions/{sessionId}", session.sessionId(), session);
+  }
+
+  @PostMapping(
+      path = "/live-read-sessions/{sessionId}/renew",
+      consumes = MediaType.APPLICATION_JSON_VALUE,
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Renew a coordinated live-read lease")
+  LiveReadSession renewLiveRead(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken,
+      @Valid @RequestBody RenewSessionRequest request) {
+    return service.renewLiveRead(request.toCommand(sessionId, fencingToken));
+  }
+
+  @PostMapping(
+      path = "/live-read-sessions/{sessionId}/complete",
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Complete a coordinated live read")
+  LiveReadSession completeLiveRead(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken) {
+    return service.completeLiveRead(sessionCommand(sessionId, fencingToken));
+  }
+
+  @PostMapping(
+      path = "/live-read-sessions/{sessionId}/abandon",
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Abandon a coordinated live read")
+  LiveReadSession abandonLiveRead(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken) {
+    return service.abandonLiveRead(sessionCommand(sessionId, fencingToken));
+  }
+
+  @PostMapping(
+      path = "/resources/{resourceId}/snapshot-sessions",
+      consumes = MediaType.APPLICATION_JSON_VALUE,
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Begin externally performed snapshot generation")
+  ResponseEntity<SnapshotGenerationSession> beginSnapshot(
+      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
+      @Valid @RequestBody BeginSessionRequest request) {
+    SnapshotGenerationSession session =
+        service.beginSnapshot(request.toSnapshotCommand(resourceId));
+    return createdSession("/snapshot-sessions/{sessionId}", session.sessionId(), session);
+  }
+
+  @PostMapping(
+      path = "/snapshot-sessions/{sessionId}/renew",
+      consumes = MediaType.APPLICATION_JSON_VALUE,
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  @Operation(summary = "Renew a snapshot-generation lease")
+  SnapshotGenerationSession renewSnapshot(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken,
+      @Valid @RequestBody RenewSessionRequest request) {
+    return service.renewSnapshot(request.toCommand(sessionId, fencingToken));
+  }
+
+  @PutMapping(path = "/snapshot-sessions/{sessionId}/snapshot")
+  @Operation(summary = "Atomically publish a complete immutable snapshot")
+  ResponseEntity<VersionGateStore.SnapshotSubmission> submitSnapshot(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken,
       HttpServletRequest request)
       throws IOException {
     long contentLength = requireContentLength(request);
-    String contentType = requireSupportedContentType(request.getContentType());
-    SnapshotComponent component =
-        service.submitSnapshotComponent(
-            new VersionGateService.SubmitComponentCommand(
-                buildId,
+    String contentType = requireContentType(request.getContentType());
+    VersionGateStore.SnapshotSubmission submission =
+        service.submitSnapshot(
+            new VersionGateService.SubmitSnapshotCommand(
+                sessionId,
                 fencingToken,
-                componentId,
                 request.getInputStream(),
                 contentLength,
                 contentType,
                 optionalHeader(
                     request, HttpHeaders.CONTENT_ENCODING, DomainValidation.TEXT_MAX_LENGTH),
-                optionalSha256Header(request),
-                optionalHeader(request, SCHEMA_VERSION_HEADER, DomainValidation.TEXT_MAX_LENGTH),
-                optionalInstantHeader(request, CAPTURED_AT_HEADER)));
+                optionalSha256Header(request)));
+    StoredSnapshot snapshot = submission.snapshot();
     URI location =
         ServletUriComponentsBuilder.fromCurrentContextPath()
-            .path("/resources/{resourceId}/versions/{version}/components/{componentId}")
-            .buildAndExpand(component.resourceId(), component.version(), component.componentId())
+            .path("/resources/{resourceId}/snapshots/versions/{version}")
+            .buildAndExpand(snapshot.resourceId(), snapshot.snapshotVersion())
             .toUri();
-    return ResponseEntity.status(HttpStatus.CREATED).location(location).body(component);
+    return submission.replayed()
+        ? ResponseEntity.ok(submission)
+        : ResponseEntity.created(location).body(submission);
   }
 
-  @PostMapping(path = "/builds/{buildId}/complete", produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Complete a build and finalize its manifest")
-  VersionManifest completeBuild(
-      @PathVariable UUID buildId,
-      @Parameter(
-              name = FENCING_TOKEN_HEADER,
-              description = "Current build ownership generation",
-              required = true,
-              schema = @Schema(type = "integer", format = "int64", minimum = "1"))
-          @RequestHeader(FENCING_TOKEN_HEADER)
-          long fencingToken) {
-    return service.completeBuild(new VersionGateService.BuildTokenCommand(buildId, fencingToken));
-  }
-
-  @PostMapping(path = "/builds/{buildId}/activate", produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Atomically activate a completed build")
-  Build activateBuild(
-      @PathVariable UUID buildId,
-      @Parameter(
-              name = FENCING_TOKEN_HEADER,
-              description = "Current build ownership generation",
-              required = true,
-              schema = @Schema(type = "integer", format = "int64", minimum = "1"))
-          @RequestHeader(FENCING_TOKEN_HEADER)
-          long fencingToken) {
-    return service.activateBuild(new VersionGateService.BuildTokenCommand(buildId, fencingToken));
-  }
-
-  @PostMapping(path = "/builds/{buildId}/abort", produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Abort a build")
-  Build abortBuild(
-      @PathVariable UUID buildId,
-      @Parameter(
-              name = FENCING_TOKEN_HEADER,
-              description = "Current build ownership generation",
-              required = true,
-              schema = @Schema(type = "integer", format = "int64", minimum = "1"))
-          @RequestHeader(FENCING_TOKEN_HEADER)
-          long fencingToken) {
-    return service.abortBuild(new VersionGateService.BuildTokenCommand(buildId, fencingToken));
-  }
-
-  @GetMapping(
-      path = "/resources/{resourceId}/versions/active/manifest",
+  @PostMapping(
+      path = "/snapshot-sessions/{sessionId}/abort",
       produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Get the active version manifest")
-  VersionManifest getActiveVersion(
-      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId) {
-    return service.getActiveVersion(resourceId);
+  @Operation(summary = "Abort snapshot generation without publishing bytes")
+  SnapshotGenerationSession abortSnapshot(
+      @PathVariable UUID sessionId,
+      @RequestHeader(FENCING_TOKEN_HEADER) @Positive long fencingToken) {
+    return service.abortSnapshot(sessionCommand(sessionId, fencingToken));
   }
 
-  @GetMapping(
-      path = "/resources/{resourceId}/versions/{version}/manifest",
-      produces = MediaType.APPLICATION_JSON_VALUE)
-  @Operation(summary = "Get a historical version manifest")
-  VersionManifest getVersionManifest(
+  @GetMapping(path = "/resources/{resourceId}/snapshots/versions/{version}")
+  @Operation(summary = "Retrieve an immutable snapshot by exact version")
+  ResponseEntity<StreamingResponseBody> getSnapshotByVersion(
       @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
       @PathVariable @PositiveOrZero long version) {
-    return service.getVersionManifest(resourceId, version);
+    return stream(service.getSnapshotByVersion(resourceId, version));
   }
 
-  @GetMapping(path = "/resources/{resourceId}/versions/{version}/components/{componentId}")
-  @Operation(summary = "Stream a snapshot component")
-  @ApiResponses({
-    @ApiResponse(
-        responseCode = "200",
-        description = "Component stream",
-        content = {
-          @Content(
-              mediaType = MediaType.APPLICATION_JSON_VALUE,
-              schema = @Schema(type = "string", format = "binary")),
-          @Content(
-              mediaType = "application/x-ndjson",
-              schema = @Schema(type = "string", format = "binary")),
-          @Content(
-              mediaType = MediaType.APPLICATION_OCTET_STREAM_VALUE,
-              schema = @Schema(type = "string", format = "binary"))
-        }),
-    @ApiResponse(responseCode = "404", description = "Component not found"),
-    @ApiResponse(responseCode = "503", description = "Snapshot storage is unavailable")
-  })
-  ResponseEntity<StreamingResponseBody> streamSnapshotComponent(
+  @GetMapping(path = "/resources/{resourceId}/snapshots/current")
+  @Operation(summary = "Retrieve the snapshot for the active version")
+  ResponseEntity<StreamingResponseBody> getCurrentSnapshot(
+      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId) {
+    return stream(service.getCurrentSnapshot(resourceId));
+  }
+
+  @GetMapping(path = "/resources/{resourceId}/snapshots/latest-available")
+  @Operation(summary = "Retrieve the highest stored snapshot version")
+  ResponseEntity<StreamingResponseBody> getLatestAvailableSnapshot(
+      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId) {
+    return stream(service.getLatestAvailableSnapshot(resourceId));
+  }
+
+  @GetMapping(path = "/resources/{resourceId}/snapshots/default")
+  @Operation(summary = "Retrieve using the resource's configured default selector")
+  ResponseEntity<StreamingResponseBody> getDefaultSnapshot(
       @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
-      @PathVariable @PositiveOrZero long version,
-      @PathVariable @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String componentId) {
-    VersionGateService.SnapshotDownload download =
-        service.streamSnapshotComponent(resourceId, version, componentId);
+      @RequestParam(required = false) @PositiveOrZero Long version) {
+    OptionalLong requestedVersion =
+        version == null ? OptionalLong.empty() : OptionalLong.of(version);
+    return stream(service.getDefaultSnapshot(resourceId, requestedVersion));
+  }
+
+  private ResponseEntity<StreamingResponseBody> stream(VersionGateStore.SnapshotContent content) {
     try {
-      SnapshotComponent component = download.component();
+      VersionGateStore.SnapshotResolution resolution = content.resolution();
+      StoredSnapshot snapshot = resolution.snapshot();
       HttpHeaders headers = new HttpHeaders();
-      headers.setContentType(MediaType.parseMediaType(component.contentType()));
-      headers.setContentLength(component.size());
-      headers.set(CHECKSUM_HEADER, component.sha256());
-      component
+      headers.setContentType(requireStoredContentType(snapshot.contentType()));
+      headers.setContentLength(snapshot.contentLength());
+      snapshot
           .contentEncoding()
           .ifPresent(
               value ->
                   headers.set(
                       HttpHeaders.CONTENT_ENCODING,
                       requireSafeResponseHeader(HttpHeaders.CONTENT_ENCODING, value)));
-      component
-          .schemaVersion()
-          .ifPresent(
-              value ->
-                  headers.set(
-                      SCHEMA_VERSION_HEADER,
-                      requireSafeResponseHeader(SCHEMA_VERSION_HEADER, value)));
-      headers.set(CAPTURED_AT_HEADER, component.capturedAt().toString());
+      headers.set(CHECKSUM_HEADER, snapshot.sha256());
+      headers.set(SNAPSHOT_VERSION_HEADER, Long.toString(snapshot.snapshotVersion()));
+      headers.set(ACTIVE_VERSION_HEADER, Long.toString(resolution.activeVersion()));
+      headers.set(SNAPSHOT_STALE_HEADER, Boolean.toString(resolution.stale()));
 
       StreamingResponseBody body =
           outputStream -> {
-            try (var content = download.content()) {
+            try (content) {
               content.inputStream().transferTo(outputStream);
             }
           };
       return new ResponseEntity<>(body, headers, HttpStatus.OK);
     } catch (RuntimeException | Error failure) {
-      try {
-        download.close();
-      } catch (Exception cleanupFailure) {
-        failure.addSuppressed(cleanupFailure);
-      }
+      closeAfterFailure(content, failure);
       throw failure;
     }
+  }
+
+  private static VersionGateService.SessionCommand sessionCommand(
+      UUID sessionId, long fencingToken) {
+    return new VersionGateService.SessionCommand(sessionId, fencingToken);
+  }
+
+  private static <T> ResponseEntity<T> createdSession(String path, UUID sessionId, T session) {
+    URI location =
+        ServletUriComponentsBuilder.fromCurrentContextPath()
+            .path(path)
+            .buildAndExpand(sessionId)
+            .toUri();
+    return ResponseEntity.created(location).body(session);
   }
 
   private static long requireContentLength(HttpServletRequest request) {
@@ -388,29 +335,20 @@ final class VersionGateController {
       throw new HttpApiException(
           HttpStatus.LENGTH_REQUIRED,
           "CONTENT_LENGTH_REQUIRED",
-          "Snapshot uploads require a Content-Length header");
+          "Snapshot submission requires a Content-Length header");
     }
     return contentLength;
   }
 
-  private static String requireSupportedContentType(String value) {
+  private static String requireContentType(String value) {
     if (!StringUtils.hasText(value)) {
-      throw unsupportedContentType("Snapshot uploads require a Content-Type header");
+      throw unsupportedContentType("Snapshot submission requires a Content-Type header");
     }
-    MediaType mediaType;
     try {
-      mediaType = MediaType.parseMediaType(value);
+      return MediaType.parseMediaType(value).toString();
     } catch (IllegalArgumentException exception) {
       throw unsupportedContentType("Snapshot Content-Type is invalid");
     }
-    String contentType =
-        mediaType.getType().toLowerCase(Locale.ROOT)
-            + "/"
-            + mediaType.getSubtype().toLowerCase(Locale.ROOT);
-    if (!VersionGateService.SUPPORTED_CONTENT_TYPES.contains(contentType)) {
-      throw unsupportedContentType("Snapshot Content-Type " + value + " is not supported");
-    }
-    return contentType;
   }
 
   private static HttpApiException unsupportedContentType(String detail) {
@@ -425,6 +363,15 @@ final class VersionGateController {
           "Stored " + name + " metadata is not safe for an HTTP response");
     }
     return value;
+  }
+
+  private static MediaType requireStoredContentType(String value) {
+    try {
+      return MediaType.parseMediaType(value);
+    } catch (IllegalArgumentException exception) {
+      throw new VersionGateException(
+          ErrorCode.STORAGE_FAILURE, "Stored Content-Type metadata is invalid", exception);
+    }
   }
 
   private static Optional<String> optionalHeader(
@@ -461,65 +408,71 @@ final class VersionGateController {
     }
   }
 
-  private static Optional<Instant> optionalInstantHeader(HttpServletRequest request, String name) {
-    Optional<String> value = optionalHeader(request, name, DomainValidation.TEXT_MAX_LENGTH);
-    if (value.isEmpty()) {
-      return Optional.empty();
-    }
+  private static void closeAfterFailure(
+      VersionGateStore.SnapshotContent content, Throwable failure) {
     try {
-      return Optional.of(Instant.parse(value.get()));
-    } catch (DateTimeParseException exception) {
-      throw new HttpApiException(
-          HttpStatus.BAD_REQUEST, "VALIDATION_FAILED", name + " must be an ISO-8601 instant");
+      content.close();
+    } catch (Exception cleanupFailure) {
+      failure.addSuppressed(cleanupFailure);
     }
   }
 
   record RegisterResourceRequest(
       @NotBlank @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String resourceId,
-      @NotNull SnapshotPolicy snapshotPolicy,
-      @NotEmpty
-          Set<@NotBlank @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String>
-              requiredComponentIds,
-      @Size(max = DomainValidation.MAX_PARTICIPANTS_PER_RESOURCE)
-          List<@Valid ParticipantRequest> participants) {
-
-    RegisterResourceRequest {
-      participants = participants == null ? List.of() : List.copyOf(participants);
-    }
+      @NotNull @Valid ResourcePoliciesRequest policies) {
 
     VersionGateService.RegisterResourceCommand toCommand() {
-      return new VersionGateService.RegisterResourceCommand(
-          resourceId,
-          snapshotPolicy,
-          requiredComponentIds,
-          participants.stream().map(ParticipantRequest::toDomain).toList());
+      return new VersionGateService.RegisterResourceCommand(resourceId, policies.toDomain());
     }
   }
 
-  record ParticipantRequest(
-      @NotBlank @Pattern(regexp = DomainValidation.IDENTIFIER_PATTERN) String participantId,
-      @NotNull URI baseUri) {
+  record ResourcePoliciesRequest(
+      @NotNull SnapshotSupport snapshotSupport,
+      @NotNull MissingCurrentSnapshotPolicy missingCurrentSnapshotPolicy,
+      WriterDuringSnapshotPolicy writerDuringSnapshotPolicy,
+      SnapshotSelector defaultSnapshotSelector,
+      RetrievalDuringWritePolicy retrievalDuringWritePolicy) {
 
-    Participant toDomain() {
-      return new Participant(participantId, baseUri);
+    ResourcePolicies toDomain() {
+      return new ResourcePolicies(
+          snapshotSupport,
+          missingCurrentSnapshotPolicy,
+          Optional.ofNullable(writerDuringSnapshotPolicy),
+          Optional.ofNullable(defaultSnapshotSelector),
+          Optional.ofNullable(retrievalDuringWritePolicy));
     }
   }
 
-  record BeginBuildRequest(
-      @NotBlank @Size(max = DomainValidation.TEXT_MAX_LENGTH) String owner,
-      @NotNull @Positive Long leaseSeconds) {
+  record BeginSessionRequest(@NotBlank String owner, @NotNull @Positive Long leaseSeconds) {
 
-    VersionGateService.BeginBuildCommand toCommand(String resourceId) {
-      return new VersionGateService.BeginBuildCommand(
+    VersionGateService.BeginWriteCommand toWriteCommand(String resourceId) {
+      return new VersionGateService.BeginWriteCommand(
+          resourceId, owner, Duration.ofSeconds(leaseSeconds));
+    }
+
+    VersionGateService.BeginLiveReadCommand toLiveReadCommand(String resourceId) {
+      return new VersionGateService.BeginLiveReadCommand(
+          resourceId, owner, Duration.ofSeconds(leaseSeconds));
+    }
+
+    VersionGateService.BeginSnapshotCommand toSnapshotCommand(String resourceId) {
+      return new VersionGateService.BeginSnapshotCommand(
           resourceId, owner, Duration.ofSeconds(leaseSeconds));
     }
   }
 
-  record RenewBuildRequest(@NotNull @Positive Long leaseSeconds) {
+  record RenewSessionRequest(@NotNull @Positive Long leaseSeconds) {
 
-    VersionGateService.RenewBuildCommand toCommand(UUID buildId, long fencingToken) {
-      return new VersionGateService.RenewBuildCommand(
-          buildId, fencingToken, Duration.ofSeconds(leaseSeconds));
+    VersionGateService.RenewSessionCommand toCommand(UUID sessionId, long fencingToken) {
+      return new VersionGateService.RenewSessionCommand(
+          sessionId, fencingToken, Duration.ofSeconds(leaseSeconds));
+    }
+  }
+
+  record FailWriteRequest(@NotBlank String reason) {
+
+    VersionGateService.FailWriteCommand toCommand(UUID sessionId, long fencingToken) {
+      return new VersionGateService.FailWriteCommand(sessionId, fencingToken, reason);
     }
   }
 }
