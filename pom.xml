@@ -42,6 +42,7 @@
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <project.build.outputTimestamp>2026-07-24T00:00:00Z</project.build.outputTimestamp>
 
+        <archunit.version>1.4.2</archunit.version>
         <springdoc.version>3.0.3</springdoc.version>
         <spotless.version>3.8.0</spotless.version>
         <google-java-format.version>1.35.0</google-java-format.version>
